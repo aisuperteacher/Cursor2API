@@ -1,0 +1,70 @@
+name: ChatGPT bridge reliability patch
+
+on:
+  push:
+    branches:
+      - fix/claude-code-bridge-reliability
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-test:
+    if: ${{ github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Apply reliability patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          base64 -d .chatgpt/apply_fix.py.gz.b64 | gzip -d > /tmp/apply_fix.py
+          python /tmp/apply_fix.py
+          rm -rf .chatgpt
+          rm -f .github/workflows/chatgpt-bridge-reliability.yml
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Run sidecar tests
+        run: npm run test:sidecar
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Build client
+        run: npm run build:client
+
+      - name: Check bridge syntax
+        run: node --check scripts/cursor-sdk-local-agent-bridge.mjs
+
+      - name: Commit verified fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'fix: improve Claude Code bridge reliability'
+          git push origin HEAD:fix/claude-code-bridge-reliability
