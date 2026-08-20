@@ -263,6 +263,7 @@ export function anthropicMessage(opts: {
   toolContext?: ToolCallContext;
   inputTokens: number;
   outputTokens: number;
+  onToolUse?: (toolUseId: string, toolCall: CursorToolCall) => void;
 }): Record<string, unknown> {
   const content: Array<Record<string, unknown>> = [];
   if (opts.text) content.push({ type: "text", text: opts.text });
@@ -272,7 +273,9 @@ export function anthropicMessage(opts: {
       ? mapAnthropicToolCall({ toolCall, tools: opts.tools, responseId: opts.id, index, context: opts.toolContext })
       : toolCall;
     if (!mapped) continue;
-    content.push(toolUseBlock(mapped));
+    const block = toolUseBlock(mapped);
+    content.push(block);
+    if (typeof block.id === "string") opts.onToolUse?.(block.id, mapped);
     emittedToolCalls += 1;
   }
   return {
@@ -296,6 +299,7 @@ export async function* anthropicSseEvents(opts: {
   stream: AsyncIterable<CursorTextEvent>;
   tools?: OpenAiToolSpec[];
   toolContext?: ToolCallContext;
+  onToolUse?: (toolUseId: string, toolCall: CursorToolCall) => void;
 }): AsyncGenerator<{ event: string; data: Record<string, unknown> }> {
   yield {
     event: "message_start",
@@ -346,6 +350,7 @@ export async function* anthropicSseEvents(opts: {
       }
       const idx = nextIndex++;
       const block = toolUseBlock(mapped);
+      if (typeof block.id === "string") opts.onToolUse?.(block.id, mapped);
       const input = block.input as Record<string, unknown>;
       yield { event: "content_block_start", data: { type: "content_block_start", index: idx, content_block: { type: "tool_use", id: block.id, name: block.name, input: {} } } };
       yield { event: "content_block_delta", data: { type: "content_block_delta", index: idx, delta: { type: "input_json_delta", partial_json: JSON.stringify(input) } } };

@@ -68,7 +68,7 @@ const SDK_SESSION_TTL_MS = 6 * 60 * 60 * 1000;
 const AGENT_MODE_AGENT = 1;
 const DEFAULT_SDK_CLIENT_VERSION = "sdk-1.0.13";
 const SDK_STREAM_START_TIMEOUT_MS = 25_000;
-const DEFAULT_SDK_BRIDGE_REQUEST_TIMEOUT_MS = 180_000;
+const DEFAULT_SDK_BRIDGE_REQUEST_TIMEOUT_MS = 300_000;
 const SDK_TOOL_RETRY_ATTEMPTS = 3;
 
 export function isTransientCursorSdkError(error: unknown): boolean {
@@ -236,7 +236,8 @@ export const cursorSdkTestExports = {
   isEmittableSdkToolCall,
   normalizeSdkToolCallForOpenCode,
   retryPromptAfterMissingTool,
-  retryPromptAfterUnsupportedTool
+  retryPromptAfterUnsupportedTool,
+  parseCursorLocalSdkBridgeNdjson
 };
 
 async function* streamCursorLocalSdkRun(
@@ -400,32 +401,71 @@ async function* streamCursorLocalSdkBridgeRun(
     workingDirectory?: string;
     clientTools?: ClientToolSpec[];
     allowToolCall?: (toolCall: CursorToolCall) => ToolCallDecision;
+    incrementalPrompt?: string;
   }
 ): AsyncGenerator<CursorTextEvent> {
-  const output = await cursorLocalSdkBridgeJson(env, deps, apiKey, input);
-  const text = typeof output.text === "string" ? output.text : "";
+  let text = "";
   const toolCalls: CursorToolCall[] = [];
-  const rawToolCalls = Array.isArray(output.toolCalls) ? output.toolCalls : [];
 
-  if (text) yield { type: "text", text };
-
-  for (const rawToolCall of rawToolCalls) {
-    if (!rawToolCall || typeof rawToolCall.name !== "string") continue;
+  const bridgeToolEvent = (rawToolCall: CursorToolCall): CursorTextEvent | undefined => {
+    if (!rawToolCall || typeof rawToolCall.name !== "string") return undefined;
     const toolCall = normalizeSdkToolCallForOpenCode({
       name: rawToolCall.name,
       arguments: isRecord(rawToolCall.arguments) ? rawToolCall.arguments : {}
     });
-    if (!isEmittableSdkToolCall(toolCall)) continue;
+    if (!isEmittableSdkToolCall(toolCall)) return undefined;
     const decision = input.allowToolCall?.(toolCall) ?? true;
     if (decision !== true) {
-      yield { type: "rejected_tool_call", toolCall, reason: typeof decision === "string" ? decision : undefined };
+      return { type: "rejected_tool_call", toolCall, reason: typeof decision === "string" ? decision : undefined };
+    }
+    return { type: "tool_call", toolCall };
+  };
+
+  for await (const bridgeEvent of cursorLocalSdkBridgeEvents(env, deps, apiKey, input)) {
+    if (bridgeEvent.type === "progress") continue;
+    if (bridgeEvent.type === "text") {
+      if (!bridgeEvent.text) continue;
+      text += bridgeEvent.text;
+      yield { type: "text", text: bridgeEvent.text };
+      continue;
+    }
+    if (bridgeEvent.type === "tool_call") {
+      const event = bridgeToolEvent(bridgeEvent.toolCall);
+      if (!event) continue;
+      if (event.type === "rejected_tool_call") {
+        yield event;
+        yield { type: "done", finalText: text, toolCalls };
+        return;
+      }
+      if (event.type !== "tool_call") continue;
+      toolCalls.push(event.toolCall);
+      yield event;
       yield { type: "done", finalText: text, toolCalls };
       return;
     }
-    toolCalls.push(toolCall);
-    yield { type: "tool_call", toolCall };
-    yield { type: "done", finalText: text, toolCalls };
-    return;
+    if (bridgeEvent.type === "done") {
+      const output = bridgeEvent.output;
+      const finalText = typeof output.text === "string" ? output.text : "";
+      if (!text && finalText) {
+        text = finalText;
+        yield { type: "text", text: finalText };
+      }
+      if (!toolCalls.length) {
+        for (const rawToolCall of Array.isArray(output.toolCalls) ? output.toolCalls : []) {
+          const event = bridgeToolEvent(rawToolCall);
+          if (!event) continue;
+          if (event.type === "rejected_tool_call") {
+            yield event;
+          } else if (event.type === "tool_call") {
+            toolCalls.push(event.toolCall);
+            yield event;
+          }
+          break;
+        }
+      }
+      yield { type: "done", finalText: text, toolCalls };
+      return;
+    }
   }
 
   yield { type: "done", finalText: text, toolCalls };
@@ -449,23 +489,40 @@ async function* streamCursorLocalSdkBridgeRunWithRetry(
   }
 ): AsyncGenerator<CursorTextEvent> {
   let attemptInput = input;
-  let lastEvents: CursorTextEvent[] = [];
   for (let attempt = 1; attempt <= SDK_TOOL_RETRY_ATTEMPTS; attempt += 1) {
-    const events: CursorTextEvent[] = [];
+    const pending: CursorTextEvent[] = [];
+    let emitted = false;
     let sawToolCall = false;
     let rejectedToolCall: CursorToolCall | undefined;
     let rejectedToolReason: string | undefined;
+
     try {
       for await (const event of streamCursorLocalSdkBridgeRun(env, deps, apiKey, attemptInput)) {
-        events.push(event);
-        if (event.type === "tool_call") sawToolCall = true;
         if (event.type === "rejected_tool_call") {
           rejectedToolCall = event.toolCall;
           rejectedToolReason = event.reason;
+          continue;
         }
+        if (event.type === "tool_call") sawToolCall = true;
+
+        if (input.requiresLocalTool && !sawToolCall) {
+          pending.push(event);
+          continue;
+        }
+
+        if (sawToolCall && pending.length) {
+          for (const buffered of pending.splice(0)) {
+            if (buffered.type !== "done") {
+              emitted = true;
+              yield buffered;
+            }
+          }
+        }
+        emitted = true;
+        yield event;
       }
     } catch (error) {
-      if (events.length === 0 && attempt < SDK_TOOL_RETRY_ATTEMPTS && isTransientCursorSdkError(error)) {
+      if (!emitted && attempt < SDK_TOOL_RETRY_ATTEMPTS && isTransientCursorSdkError(error)) {
         attemptInput = {
           ...input,
           runId: newLocalSdkRunId(deps.randomUUID())
@@ -475,24 +532,24 @@ async function* streamCursorLocalSdkBridgeRunWithRetry(
       throw error;
     }
 
-    if (sawToolCall) {
-      for (const event of events) yield event;
-      return;
+    if (sawToolCall) return;
+
+    const shouldRetry = rejectedToolCall || input.requiresLocalTool;
+    if (shouldRetry && !emitted && attempt < SDK_TOOL_RETRY_ATTEMPTS) {
+      attemptInput = {
+        ...input,
+        runId: newLocalSdkRunId(deps.randomUUID()),
+        incrementalPrompt: undefined,
+        prompt: rejectedToolCall
+          ? retryPromptAfterUnsupportedTool(input.prompt, rejectedToolCall, rejectedToolReason, attempt + 1, SDK_TOOL_RETRY_ATTEMPTS)
+          : retryPromptAfterMissingTool(input.prompt, attempt + 1, SDK_TOOL_RETRY_ATTEMPTS)
+      };
+      continue;
     }
 
-    lastEvents = events;
-    const shouldRetry = rejectedToolCall || input.requiresLocalTool;
-    if (!shouldRetry || attempt >= SDK_TOOL_RETRY_ATTEMPTS) break;
-    attemptInput = {
-      ...input,
-      runId: newLocalSdkRunId(deps.randomUUID()),
-      prompt: rejectedToolCall
-        ? retryPromptAfterUnsupportedTool(input.prompt, rejectedToolCall, rejectedToolReason, attempt + 1, SDK_TOOL_RETRY_ATTEMPTS)
-        : retryPromptAfterMissingTool(input.prompt, attempt + 1, SDK_TOOL_RETRY_ATTEMPTS)
-    };
+    for (const event of pending) yield event;
+    return;
   }
-
-  for (const event of lastEvents) yield event;
 }
 
 function retryPromptAfterMissingTool(prompt: string, attempt = 2, maxAttempts = SDK_TOOL_RETRY_ATTEMPTS): string {
@@ -564,7 +621,13 @@ async function cursorLocalSdkRaw(
   return response;
 }
 
-async function cursorLocalSdkBridgeJson(
+type CursorSdkBridgeEvent =
+  | { type: "text"; text: string }
+  | { type: "tool_call"; toolCall: CursorToolCall }
+  | { type: "progress"; kind?: string }
+  | { type: "done"; output: CursorSdkBridgeOutput };
+
+async function* cursorLocalSdkBridgeEvents(
   env: Env,
   deps: Deps,
   apiKey: string,
@@ -578,7 +641,7 @@ async function cursorLocalSdkBridgeJson(
     clientTools?: ClientToolSpec[];
     incrementalPrompt?: string;
   }
-): Promise<CursorSdkBridgeOutput> {
+): AsyncGenerator<CursorSdkBridgeEvent> {
   const body = JSON.stringify({
     apiKey,
     requestId: input.runId,
@@ -587,7 +650,8 @@ async function cursorLocalSdkBridgeJson(
     incrementalPrompt: input.incrementalPrompt,
     sessionKey: input.sessionKey || input.agentId,
     workingDirectory: sdkWorkingDirectory(input.workingDirectory),
-    tools: bridgeClientTools(input.clientTools)
+    tools: bridgeClientTools(input.clientTools),
+    streamEvents: true
   });
   const bridgeBinding = env.CURSOR_SDK_BRIDGE_CONTAINER;
   const bridgeUrl = env.CURSOR_SDK_BRIDGE_URL?.trim();
@@ -599,7 +663,90 @@ async function cursorLocalSdkBridgeJson(
         : Promise.resolve(undefined)
   );
   if (!response) throw new HttpError("Cursor SDK bridge is not configured", 500, "cursor_sdk_bridge_missing");
-  return parseCursorLocalSdkBridgeJsonResponse(response);
+
+  if (!response.ok) {
+    await parseCursorLocalSdkBridgeJsonResponse(response);
+    return;
+  }
+
+  const contentType = response.headers.get("content-type")?.toLowerCase() || "";
+  if (!response.body || !contentType.includes("application/x-ndjson")) {
+    yield { type: "done", output: await parseCursorLocalSdkBridgeJsonResponse(response) };
+    return;
+  }
+
+  for await (const object of parseCursorLocalSdkBridgeNdjson(response.body)) {
+    const type = typeof object.type === "string" ? object.type : "";
+    if (type === "progress") {
+      yield { type: "progress", kind: typeof object.kind === "string" ? object.kind : undefined };
+      continue;
+    }
+    if (type === "text" && typeof object.text === "string") {
+      yield { type: "text", text: object.text };
+      continue;
+    }
+    if (type === "tool_call" && isRecord(object.toolCall)) {
+      const calls = cursorToolCallFromJson(object.toolCall);
+      if (calls[0]) yield { type: "tool_call", toolCall: calls[0] };
+      continue;
+    }
+    if (type === "error") {
+      const error = isRecord(object.error) ? object.error : undefined;
+      const message = typeof error?.message === "string" && error.message
+        ? error.message
+        : "Cursor SDK bridge stream failed";
+      const code = typeof error?.code === "string" && error.code ? error.code : "cursor_sdk_bridge_error";
+      const status = code.includes("timeout") ? 504 : 502;
+      throw new HttpError(message, status, code);
+    }
+    if (type === "done") {
+      yield { type: "done", output: cursorSdkBridgeOutputFromObject(object.output) };
+      return;
+    }
+  }
+
+  throw new HttpError("Cursor SDK bridge stream ended without a terminal event", 502, "cursor_sdk_bridge_incomplete_stream");
+}
+
+async function* parseCursorLocalSdkBridgeNdjson(body: ReadableStream<Uint8Array>): AsyncGenerator<Record<string, unknown>> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const parseLine = (line: string): Record<string, unknown> | undefined => {
+    const trimmed = line.trim();
+    if (!trimmed) return undefined;
+    let value: unknown;
+    try {
+      value = JSON.parse(trimmed);
+    } catch {
+      throw new HttpError("Cursor SDK bridge returned invalid NDJSON", 502, "cursor_sdk_bridge_invalid_ndjson");
+    }
+    if (!isRecord(value)) {
+      throw new HttpError("Cursor SDK bridge returned invalid NDJSON", 502, "cursor_sdk_bridge_invalid_ndjson");
+    }
+    return value;
+  };
+
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      for (;;) {
+        const newline = buffer.indexOf("\n");
+        if (newline < 0) break;
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        const parsed = parseLine(line);
+        if (parsed) yield parsed;
+      }
+    }
+    buffer += decoder.decode();
+    const parsed = parseLine(buffer);
+    if (parsed) yield parsed;
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 async function cursorLocalSdkUrlBridgeJson(env: Env, deps: Deps, bridgeUrl: string, body: string, signal?: AbortSignal): Promise<Response> {
@@ -671,6 +818,10 @@ async function parseCursorLocalSdkBridgeJsonResponse(response: Response): Promis
     const status = response.status === 401 ? 502 : response.status === 429 ? 429 : response.status >= 500 ? 502 : 400;
     throw new HttpError(message, status, code);
   }
+  return cursorSdkBridgeOutputFromObject(object);
+}
+
+function cursorSdkBridgeOutputFromObject(object: unknown): CursorSdkBridgeOutput {
   if (!isRecord(object)) {
     throw new HttpError("Cursor SDK bridge returned invalid JSON", 502, "cursor_sdk_bridge_invalid_json");
   }

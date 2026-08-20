@@ -15,9 +15,12 @@ loadEnvFile(path.join(process.cwd(), ".env"));
 const host = process.env.CURSOR_SDK_BRIDGE_HOST || "127.0.0.1";
 const port = parseInteger(process.env.CURSOR_SDK_BRIDGE_PORT, 8792);
 const bridgeToken = process.env.CURSOR_SDK_BRIDGE_TOKEN || "";
-const maxJsonBytes = parseInteger(process.env.CURSOR_SDK_BRIDGE_MAX_JSON_BYTES, 1024 * 1024);
+const maxJsonBytes = parseInteger(process.env.CURSOR_SDK_BRIDGE_MAX_JSON_BYTES, 16 * 1024 * 1024);
 const maxAgents = parseInteger(process.env.CURSOR_SDK_BRIDGE_MAX_AGENTS, 128);
-const runTimeoutMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_RUN_TIMEOUT_MS, 180 * 1000);
+const legacyRunTimeoutMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_RUN_TIMEOUT_MS, 0);
+const runIdleTimeoutMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_IDLE_TIMEOUT_MS, legacyRunTimeoutMs || 300 * 1000);
+const runHardTimeoutMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_HARD_TIMEOUT_MS, 600 * 1000);
+const maxLoggedToolNames = parseInteger(process.env.CURSOR_SDK_BRIDGE_MAX_LOGGED_TOOL_NAMES, 12);
 const maxRunRetries = parseInteger(process.env.CURSOR_SDK_BRIDGE_MAX_RUN_RETRIES, 3);
 const retryBaseDelayMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_RETRY_BASE_DELAY_MS, 500);
 const agentRuntimeRefreshMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_AGENT_REFRESH_MS, 45 * 60 * 1000);
@@ -55,6 +58,7 @@ export {
   isAuthenticationSDKError,
   isRetryableSDKRunError,
   composerToolCallFromText,
+  createRunTimeoutController,
   normalizeSDKToolCall,
   normalizeModel,
   openAiError,
@@ -133,7 +137,7 @@ async function handleRequest(request, response) {
     mode: "agent",
     model: sdkModelSelection(model),
     toolCount: clientTools.length,
-    toolNames: clientTools.map((tool) => tool.name)
+    ...loggedToolNames(clientTools)
   }));
 
   const input = {
@@ -217,38 +221,140 @@ async function runLocalAgent(input, onEvent) {
   }
 }
 
+function loggedToolNames(clientTools) {
+  const toolNames = clientTools.slice(0, maxLoggedToolNames).map((tool) => tool.name);
+  return {
+    toolNames,
+    toolNamesTruncated: Math.max(0, clientTools.length - toolNames.length)
+  };
+}
+
+function progressKind(value, fallback = "progress") {
+  if (!value || typeof value !== "object") return fallback;
+  const kind = typeof value.type === "string" && value.type.trim() ? value.type.trim() : "";
+  return kind ? `${fallback}:${kind}` : fallback;
+}
+
+function createRunTimeoutController({
+  requestId = "",
+  idleTimeoutMs = runIdleTimeoutMs,
+  hardTimeoutMs = runHardTimeoutMs,
+  onTimeout
+} = {}) {
+  const startedAt = Date.now();
+  let lastProgressAt = startedAt;
+  let lastProgressKind = "run_start";
+  let idleTimer = null;
+  let hardTimer = null;
+  let stopped = false;
+  let rejectTimeout;
+  const promise = new Promise((_resolve, reject) => {
+    rejectTimeout = reject;
+  });
+
+  const clearTimers = () => {
+    if (idleTimer) clearTimeout(idleTimer);
+    if (hardTimer) clearTimeout(hardTimer);
+    idleTimer = null;
+    hardTimer = null;
+  };
+
+  const fail = (timeoutType) => {
+    if (stopped) return;
+    stopped = true;
+    clearTimers();
+    const now = Date.now();
+    const error = new HttpError(
+      timeoutType === "idle"
+        ? "Cursor SDK bridge run timed out while idle."
+        : "Cursor SDK bridge run exceeded the hard timeout.",
+      504,
+      "cursor_sdk_timeout"
+    );
+    error.timeoutType = timeoutType;
+    error.elapsedMs = Math.max(0, now - startedAt);
+    error.idleForMs = Math.max(0, now - lastProgressAt);
+    error.lastProgressKind = lastProgressKind;
+    console.warn(JSON.stringify({
+      event: "sdk_timeout",
+      requestId,
+      timeoutType,
+      elapsedMs: error.elapsedMs,
+      idleForMs: error.idleForMs,
+      lastProgressKind
+    }));
+    try {
+      onTimeout?.(error);
+    } catch {}
+    rejectTimeout(error);
+  };
+
+  const armIdle = () => {
+    if (stopped) return;
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => fail("idle"), idleTimeoutMs);
+  };
+
+  armIdle();
+  hardTimer = setTimeout(() => fail("hard"), hardTimeoutMs);
+
+  return {
+    promise,
+    progress(kind = "progress") {
+      if (stopped) return;
+      lastProgressAt = Date.now();
+      lastProgressKind = String(kind || "progress").slice(0, 80);
+      armIdle();
+    },
+    snapshot() {
+      const now = Date.now();
+      return {
+        elapsedMs: Math.max(0, now - startedAt),
+        idleForMs: Math.max(0, now - lastProgressAt),
+        lastProgressKind
+      };
+    },
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      clearTimers();
+    }
+  };
+}
+
 async function runLocalAgentUnlocked(input, onEvent) {
   for (let attempt = 0; ; attempt += 1) {
     let activeRun = null;
-    let emittedEvent = false;
-    let timer = null;
+    let emittedOutputEvent = false;
     const emit = onEvent
       ? (event) => {
-          emittedEvent = true;
+          if (event?.type !== "progress") emittedOutputEvent = true;
           return onEvent(event);
         }
       : undefined;
+    const timeoutControl = createRunTimeoutController({
+      requestId: input.requestId,
+      onTimeout: () => {
+        if (activeRun) activeRun.cancel().catch(() => {});
+      }
+    });
+    const progress = (kind) => {
+      timeoutControl.progress(kind);
+      if (onEvent) onEvent({ type: "progress", kind });
+    };
     const work = runLocalAgentBody(input, (run) => {
       activeRun = run;
-    }, emit);
-    const timeout = new Promise((_resolve, reject) => {
-      timer = setTimeout(() => {
-        const error = new HttpError("Cursor SDK bridge run timed out.", 504, "cursor_sdk_timeout");
-        reject(error);
-        if (activeRun) {
-          activeRun.cancel().catch(() => {});
-        }
-      }, runTimeoutMs);
-    });
+      progress("run_ready");
+    }, emit, progress);
 
     try {
-      return await Promise.race([work, timeout]);
+      return await Promise.race([work, timeoutControl.promise]);
     } catch (error) {
       work.catch(() => {});
       const authenticationFailure = isAuthenticationSDKError(error);
       const shouldRetry =
         attempt < maxRunRetries &&
-        !emittedEvent &&
+        !emittedOutputEvent &&
         (authenticationFailure || isRetryableSDKRunError(error));
       if (activeRun) activeRun.cancel().catch(() => {});
       if (authenticationFailure) {
@@ -259,7 +365,7 @@ async function runLocalAgentUnlocked(input, onEvent) {
       console.warn(`Retrying Cursor SDK run after ${authenticationFailure ? "authentication refresh" : "retryable upstream error"} (${attempt + 1}/${maxRunRetries}).`);
       await sleep(retryDelayMs(attempt));
     } finally {
-      if (timer) clearTimeout(timer);
+      timeoutControl.stop();
     }
   }
 }
@@ -285,19 +391,22 @@ async function runExclusiveForAgent(input, work) {
   }
 }
 
-async function runLocalAgentBody(input, onRun, onEvent) {
+async function runLocalAgentBody(input, onRun, onEvent, onProgress = () => {}) {
   const cacheKey = agentCacheKey(input);
+  const startedAt = Date.now();
   let agentEntry = null;
   let run;
   let capturedToolCall = null;
   let cancelRequested = false;
   let text = "";
+  let firstTextLogged = false;
 
   const captureToolCall = async (toolCall, options = {}) => {
     if (capturedToolCall || !toolCall) return;
     const normalized = normalizeSDKToolCall(toolCall, input.clientTools);
     if (!normalized || !isForwardableSDKToolCall(normalized, input.clientTools)) return;
     capturedToolCall = normalized;
+    onProgress("tool_call");
     if (onEvent) onEvent({ type: "tool_call", toolCall: capturedToolCall });
     cancelRequested = true;
     if (run) {
@@ -320,11 +429,24 @@ async function runLocalAgentBody(input, onRun, onEvent) {
     const agent = agentEntry.agent;
     const prompt = agentEntry.cached && input.incrementalPrompt ? input.incrementalPrompt : input.prompt;
     const force = forceNextRunAgentKeys.delete(cacheKey);
+    const toolSummary = loggedToolNames(input.clientTools ?? []);
+    console.info(JSON.stringify({
+      event: "sdk_send_start",
+      requestId: input.requestId,
+      cached: agentEntry.cached,
+      promptChars: prompt.length,
+      force,
+      toolCount: input.clientTools?.length ?? 0,
+      ...toolSummary
+    }));
+    onProgress(agentEntry.cached ? "agent_cached" : "agent_created");
+    onProgress("sdk_send_start");
 
     run = await agent.send(prompt, {
       ...localAgentSendOptions(input, { force }),
       idempotencyKey: input.requestId,
       onDelta: async ({ update }) => {
+        onProgress(progressKind(update, "delta"));
         const toolCall = toolCallFromDelta(update);
         if (toolCall) await captureToolCall(toolCall);
       }
@@ -337,10 +459,19 @@ async function runLocalAgentBody(input, onRun, onEvent) {
 
     if (!capturedToolCall) {
       for await (const event of run.stream()) {
+        onProgress(progressKind(event, "stream"));
         if (event.type === "assistant") {
           for (const block of event.message?.content ?? []) {
             if (block?.type === "text" && typeof block.text === "string") {
               text += block.text;
+              if (!firstTextLogged && block.text) {
+                firstTextLogged = true;
+                console.info(JSON.stringify({
+                  event: "sdk_first_text",
+                  requestId: input.requestId,
+                  elapsedMs: Math.max(0, Date.now() - startedAt)
+                }));
+              }
               if (onEvent && block.text) onEvent({ type: "text", text: block.text });
             }
           }
@@ -377,7 +508,9 @@ async function runLocalAgentBody(input, onRun, onEvent) {
     };
   }
 
+  onProgress("sdk_wait_start");
   const result = await run.wait();
+  onProgress("sdk_wait_done");
   if (result.status === "error") {
     if (agentEntry) evictAgent(agentEntry.cacheKey, agentEntry.agent);
     throw sdkRunFailureError(result);
@@ -2211,11 +2344,15 @@ function parseClientTools(value) {
 }
 
 async function readJsonBody(request) {
-  let body = "";
+  const chunks = [];
+  let bodyBytes = 0;
   for await (const chunk of request) {
-    body += chunk;
-    if (body.length > maxJsonBytes) throw new HttpError("Request body too large", 413, "request_too_large");
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bodyBytes += bytes.length;
+    if (bodyBytes > maxJsonBytes) throw new HttpError("Request body too large", 413, "request_too_large");
+    chunks.push(bytes);
   }
+  const body = Buffer.concat(chunks, bodyBytes).toString("utf8");
   if (!body.trim()) return {};
   try {
     return JSON.parse(body);

@@ -42,6 +42,7 @@ import {
   responseDeltaEvent,
   responseDoneEvents,
   responseErrorEvent,
+  responseFailedEvent,
   responseObject,
   responseTextStartEvents,
   responseToolCallEvents,
@@ -72,14 +73,18 @@ import {
   canonicalModelId,
   CursorCredentialPool,
   isBillingError,
-  parseCursorCredentialEnv
+  parseCursorCredentialEnv,
+  type PoolCredential
 } from "./router";
+import { AsyncStaleCache } from "./async-stale-cache";
+import { AnthropicSessionLinkStore, preferCredential, type AnthropicContinuation } from "./anthropic-session";
 import { LocalAuthStore, sessionCookie, sessionToken } from "./auth";
 
 const HOST = process.env.HOST?.trim() || "127.0.0.1";
 const DEFAULT_PORT = 8787;
 const PRIMARY_MODEL = "auto";
 const STATIC_DIR = process.env.STATIC_DIR?.trim() ? resolve(process.env.STATIC_DIR.trim()) : "";
+const MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024;
 
 /**
  * Minimal `Deps` backed by the real runtime. Identical in spirit to the
@@ -113,7 +118,7 @@ function buildEnv(): Env {
     CURSOR_CLIENT_VERSION: process.env.CURSOR_CLIENT_VERSION || "2.6.22",
     CURSOR_SDK_BRIDGE_URL: process.env.CURSOR_SDK_BRIDGE_URL,
     CURSOR_SDK_BRIDGE_TOKEN: process.env.CURSOR_SDK_BRIDGE_TOKEN,
-    CURSOR_SDK_BRIDGE_TIMEOUT_MS: process.env.CURSOR_SDK_BRIDGE_RUN_TIMEOUT_MS
+    CURSOR_SDK_BRIDGE_TIMEOUT_MS: process.env.CURSOR_SDK_BRIDGE_IDLE_TIMEOUT_MS || process.env.CURSOR_SDK_BRIDGE_RUN_TIMEOUT_MS
   };
 }
 
@@ -126,6 +131,7 @@ const credentialPool = new CursorCredentialPool(
 const authStatePath = process.env.LOCAL_AUTH_STATE_PATH?.trim()
   || (process.env.CURSOR_ROUTER_STATE_PATH?.trim() || ".cursor2api/router-state.json") + ".auth";
 const authStore = new LocalAuthStore(authStatePath, process.env.ADMIN_PASSWORD || "");
+const anthropicSessionLinks = new AnthropicSessionLinkStore();
 
 /**
  * The SDK bridge path (full macOS parity) is the PRIMARY route for
@@ -349,7 +355,7 @@ interface CursorCatalogModel {
 }
 
 const MODEL_CATALOG_TTL_MS = 60_000;
-const modelCatalogCache = new Map<string, { models: CursorCatalogModel[]; expiresAt: number }>();
+const modelCatalogCache = new AsyncStaleCache<CursorCatalogModel[]>(MODEL_CATALOG_TTL_MS);
 
 async function modelCatalogCacheKey(apiKey: string): Promise<string> {
   const bytes = new TextEncoder().encode(apiKey);
@@ -370,37 +376,34 @@ function cursorSdkModelsUrl(): string {
 
 async function liveCursorModels(apiKey: string): Promise<CursorCatalogModel[]> {
   const cacheKey = await modelCatalogCacheKey(apiKey);
-  const cached = modelCatalogCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) return cached.models;
+  return modelCatalogCache.get(cacheKey, async () => {
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    const bridgeToken = env.CURSOR_SDK_BRIDGE_TOKEN?.trim();
+    if (bridgeToken) headers.authorization = `Bearer ${bridgeToken}`;
 
-  const headers: Record<string, string> = { "content-type": "application/json" };
-  const bridgeToken = env.CURSOR_SDK_BRIDGE_TOKEN?.trim();
-  if (bridgeToken) headers.authorization = `Bearer ${bridgeToken}`;
-
-  const response = await deps.fetch(cursorSdkModelsUrl(), {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ apiKey })
-  });
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    let message = text || `Cursor model discovery failed with status ${response.status}`;
-    try {
-      const payload = JSON.parse(text) as { error?: { message?: string } };
-      if (payload.error?.message) message = payload.error.message;
-    } catch {
-      // Keep the raw response text.
+    const response = await deps.fetch(cursorSdkModelsUrl(), {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ apiKey })
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      let message = text || `Cursor model discovery failed with status ${response.status}`;
+      try {
+        const payload = JSON.parse(text) as { error?: { message?: string } };
+        if (payload.error?.message) message = payload.error.message;
+      } catch {
+        // Keep the raw response text.
+      }
+      const status = response.status === 401 ? 401 : response.status === 429 ? 429 : 502;
+      throw new HttpError(message, status, response.status === 401 ? "cursor_unauthorized" : "cursor_models_error");
     }
-    const status = response.status === 401 ? 401 : response.status === 429 ? 429 : 502;
-    throw new HttpError(message, status, response.status === 401 ? "cursor_unauthorized" : "cursor_models_error");
-  }
 
-  const payload = await response.json() as { models?: CursorCatalogModel[] };
-  const models = Array.isArray(payload.models)
-    ? payload.models.filter((model) => model && typeof model.id === "string" && typeof model.displayName === "string")
-    : [];
-  modelCatalogCache.set(cacheKey, { models, expiresAt: Date.now() + MODEL_CATALOG_TTL_MS });
-  return models;
+    const payload = await response.json() as { models?: CursorCatalogModel[] };
+    return Array.isArray(payload.models)
+      ? payload.models.filter((model) => model && typeof model.id === "string" && typeof model.displayName === "string")
+      : [];
+  });
 }
 
 function parameterizedModelId(modelId: string, params: Array<{ id: string; value: string }>): string {
@@ -606,15 +609,17 @@ async function handleLocalCredentials(request: Request, credentialId = ""): Prom
 async function routeCredentialRequest(
   request: Request,
   requestedModel: string,
-  run: (apiKey: string, onBillingError?: (error: unknown) => void) => Promise<Response>
+  run: (apiKey: string, onBillingError: ((error: unknown) => void) | undefined, credential: PoolCredential) => Promise<Response>,
+  preferredCredentialId?: string
 ): Promise<Response> {
   if (!resolveAccess(request)) return unauthorized();
 
-  const candidates = await credentialPool.candidates(
+  let candidates = await credentialPool.candidates(
     requestedModel,
     sessionAffinity(request),
     liveCursorModels
   );
+  candidates = preferCredential(candidates, preferredCredentialId);
   if (!candidates.length) {
     throw new HttpError(`Model '${requestedModel}' is not available for the configured Cursor credential pool`, 404, "model_not_found", "model");
   }
@@ -633,7 +638,7 @@ async function routeCredentialRequest(
       }));
     };
     try {
-      return await run(credential.apiKey, disableOnBilling);
+      return await run(credential.apiKey, disableOnBilling, credential);
     } catch (error) {
       if (!isBillingError(error)) throw error;
       lastBillingError = error;
@@ -917,9 +922,10 @@ async function handleAnthropicMessages(request: Request): Promise<Response> {
     body && typeof body === "object" && typeof (body as { model?: unknown }).model === "string"
       ? (body as { model: string }).model
       : PRIMARY_MODEL;
-  return routeCredentialRequest(request, requestedModel, (apiKey, onBillingError) => (
-    handleAnthropicMessagesWithKey(request, body, requestedModel, apiKey, onBillingError)
-  ));
+  const continuation = anthropicSessionLinks.findFromBody(body);
+  return routeCredentialRequest(request, requestedModel, (apiKey, onBillingError, credential) => (
+    handleAnthropicMessagesWithKey(request, body, requestedModel, apiKey, credential, continuation, onBillingError)
+  ), continuation?.link.credentialId);
 }
 
 async function handleAnthropicMessagesWithKey(
@@ -927,6 +933,8 @@ async function handleAnthropicMessagesWithKey(
   body: unknown,
   requestedModel: string,
   apiKey: string,
+  credential: PoolCredential,
+  continuation?: AnthropicContinuation,
   onBillingError?: (error: unknown) => void
 ): Promise<Response> {
   const translatedBody = anthropicToChatBody(body);
@@ -938,14 +946,32 @@ async function handleAnthropicMessagesWithKey(
   const id = `msg_${crypto.randomUUID().replaceAll("-", "")}`;
   const inputTokens = estimateTokens(prepared.promptChars);
 
-  // Claude Code resends the full conversation (incl. tool_result) every turn, so /v1/messages is
-  // stateless: a fresh SDK session + full prompt per request, plus the transparent auto-retry.
-  const makeStream = async (_attempt: number): Promise<AsyncIterable<CursorTextEvent>> => {
+  const credentialPinned = Boolean(continuation && continuation.link.credentialId === credential.id);
+  const reused = credentialPinned;
+  const baseSessionKey = reused ? continuation!.link.sessionKey : `cc-${crypto.randomUUID()}`;
+  if (continuation && !reused) anthropicSessionLinks.clearSession(continuation.link.sessionKey);
+  const incrementalPrompt = reused ? chatIncrementalPrompt(translatedBody, cursorModel) : undefined;
+  let activeSessionKey = baseSessionKey;
+
+  console.info(JSON.stringify({
+    event: "claude_session_route",
+    source: continuation ? "tool_result" : "fresh",
+    reused,
+    credentialPinned,
+    incrementalPromptChars: incrementalPrompt?.text.length ?? 0
+  }));
+
+  const makeStream = async (attempt: number): Promise<AsyncIterable<CursorTextEvent>> => {
+    if (attempt > 0) {
+      anthropicSessionLinks.clearSession(activeSessionKey);
+      activeSessionKey = `cc-retry-${crypto.randomUUID()}`;
+    }
     const completion = await createCursorSdkCompletion(env, deps, apiKey, {
       prompt: prepared.prompt,
       model: prepared.cursorModel,
-      sessionKey: `cc-${crypto.randomUUID()}`,
+      sessionKey: activeSessionKey,
       sessionOwnerKey: sdkSessionOwner(apiKey),
+      incrementalPrompt: attempt === 0 && reused ? incrementalPrompt : undefined,
       workingDirectory: prepared.toolContext?.workingDirectory,
       clientTools: prepared.tools,
       requiresLocalTool: prepared.requiresLocalTool,
@@ -954,6 +980,16 @@ async function handleAnthropicMessagesWithKey(
     return completion.stream;
   };
   const stream = retryingSdkStream(makeStream);
+  const rememberToolUse = (toolUseId: string): void => {
+    anthropicSessionLinks.remember(toolUseId, {
+      sessionKey: activeSessionKey,
+      credentialId: credential.id
+    });
+  };
+  const cleanupFailedSession = (error: unknown): void => {
+    anthropicSessionLinks.clearSession(activeSessionKey);
+    onBillingError?.(error);
+  };
 
   if (prepared.stream) {
     return anthropicSseResponse(anthropicSseEvents({
@@ -962,23 +998,30 @@ async function handleAnthropicMessagesWithKey(
       inputTokens,
       stream,
       tools: prepared.tools,
-      toolContext: prepared.toolContext
-    }), onBillingError);
+      toolContext: prepared.toolContext,
+      onToolUse: rememberToolUse
+    }), cleanupFailedSession);
   }
 
-  const output = await collectCursorSdkOutput(stream);
-  return json(
-    anthropicMessage({
-      id,
-      model: requestedModel,
-      text: output.text,
-      toolCalls: output.toolCalls,
-      tools: prepared.tools,
-      toolContext: prepared.toolContext,
-      inputTokens,
-      outputTokens: estimateTokens(output.text.length)
-    })
-  );
+  try {
+    const output = await collectCursorSdkOutput(stream);
+    return json(
+      anthropicMessage({
+        id,
+        model: requestedModel,
+        text: output.text,
+        toolCalls: output.toolCalls,
+        tools: prepared.tools,
+        toolContext: prepared.toolContext,
+        inputTokens,
+        outputTokens: estimateTokens(output.text.length),
+        onToolUse: rememberToolUse
+      })
+    );
+  } catch (error) {
+    cleanupFailedSession(error);
+    throw error;
+  }
 }
 
 /** `POST /v1/messages/count_tokens` — Claude Code's pre-send estimate. Uses the
@@ -1096,7 +1139,8 @@ function logToolForwarding(surface: string, prepared: PreparedRequest): void {
     surface,
     mode: prepared.prompt.mode,
     toolCount: prepared.tools.length,
-    toolNames: prepared.tools.map((tool) => tool.name),
+    toolNames: prepared.tools.slice(0, 12).map((tool) => tool.name),
+    toolNamesTruncated: Math.max(0, prepared.tools.length - 12),
     requiresLocalTool: prepared.requiresLocalTool
   }));
 }
@@ -1243,7 +1287,13 @@ function streamOpenAiEvents(
       await writer
         .write(
           kind === "responses"
-            ? responseErrorEvent(message)
+            ? responseFailedEvent({
+                id: input.id,
+                created: input.created,
+                model: input.model,
+                message,
+                metadata: input.metadata
+              })
             : encodeSse({ error: { message, type: "cursor_error", code: "cursor_stream_error" } }, "error")
         )
         .catch(() => undefined);
@@ -1423,9 +1473,23 @@ function toWebRequest(req: IncomingMessage, port: number): Request {
   const init: RequestInit = { method, headers };
   if (method !== "GET" && method !== "HEAD") {
     const chunks: Buffer[] = [];
+    let bodyBytes = 0;
+    let overflow = false;
     const bodyPromise = new Promise<Buffer>((resolve, reject) => {
-      req.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
-      req.on("end", () => resolve(Buffer.concat(chunks)));
+      req.on("data", (chunk) => {
+        if (overflow) return;
+        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        bodyBytes += bytes.length;
+        if (bodyBytes > MAX_REQUEST_BODY_BYTES) {
+          overflow = true;
+          reject(new HttpError("Request body too large", 413, "request_too_large"));
+          return;
+        }
+        chunks.push(bytes);
+      });
+      req.on("end", () => {
+        if (!overflow) resolve(Buffer.concat(chunks, bodyBytes));
+      });
       req.on("error", reject);
     });
     // Materialize the body synchronously-ish: callers await `route`, which

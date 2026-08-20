@@ -549,6 +549,48 @@ export function responseErrorEvent(message: string, sequenceNumber = 0): Uint8Ar
   );
 }
 
+export function responseFailedEvent(input: {
+  id: string;
+  created: number;
+  model: string;
+  message: string;
+  metadata?: Record<string, unknown>;
+  sequenceNumber?: number;
+}): Uint8Array {
+  const response = {
+    id: input.id,
+    object: "response",
+    created_at: input.created,
+    incomplete_details: null,
+    model: input.model,
+    output: [],
+    parallel_tool_calls: true,
+    previous_response_id: null,
+    reasoning: { effort: null, summary: null },
+    store: false,
+    tool_choice: "auto",
+    tools: [],
+    truncation: "disabled",
+    usage: null,
+    user: null,
+    metadata: {},
+    ...input.metadata,
+    status: "failed",
+    error: {
+      code: "cursor_stream_error",
+      message: input.message
+    }
+  };
+  return encodeSse(
+    {
+      type: "response.failed",
+      sequence_number: input.sequenceNumber ?? 0,
+      response
+    },
+    "response.failed"
+  );
+}
+
 export function responseTextStartEvents(input: { id: string; outputIndex: number }): Uint8Array[] {
   const item = {
     id: `msg_${input.id.slice(5)}`,

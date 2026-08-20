@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { spawn, spawnSync } from "node:child_process";
 import http from "node:http";
 import { fileURLToPath } from "node:url";
@@ -7,6 +7,7 @@ import {
   clientForwardingMcpServerSource,
   clientMcpToolDefinitions,
   composerToolCallFromText,
+  createRunTimeoutController,
   localAgentCreateOptions,
   localAgentSendOptions,
   isAuthenticationSDKError,
@@ -2000,5 +2001,47 @@ describe("Cursor SDK local-agent bridge", () => {
     expect(typeof dynamicSendOptions.local.customTools.probe_write_file.execute).toBe("function");
     expect(baseSendOptions).not.toHaveProperty("mcpServers");
     expect(dynamicSendOptions).not.toHaveProperty("mcpServers");
+  });
+});
+
+
+describe("Cursor SDK bridge deadlines", () => {
+  it("refreshes the idle deadline on progress", async () => {
+    vi.useFakeTimers();
+    try {
+      let failure;
+      const timeout = createRunTimeoutController({ requestId: "idle-test", idleTimeoutMs: 100, hardTimeoutMs: 500 });
+      timeout.promise.catch((error) => { failure = error; });
+      await vi.advanceTimersByTimeAsync(80);
+      expect(failure).toBeUndefined();
+      timeout.progress("delta:assistant");
+      await vi.advanceTimersByTimeAsync(80);
+      expect(failure).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(21);
+      expect(failure?.timeoutType).toBe("idle");
+      expect(failure?.lastProgressKind).toBe("delta:assistant");
+      timeout.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not refresh the hard deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      let failure;
+      const timeout = createRunTimeoutController({ requestId: "hard-test", idleTimeoutMs: 1_000, hardTimeoutMs: 250 });
+      timeout.promise.catch((error) => { failure = error; });
+      await vi.advanceTimersByTimeAsync(100);
+      timeout.progress("delta:first");
+      await vi.advanceTimersByTimeAsync(100);
+      timeout.progress("delta:second");
+      await vi.advanceTimersByTimeAsync(51);
+      expect(failure?.timeoutType).toBe("hard");
+      expect(failure?.elapsedMs).toBeGreaterThanOrEqual(250);
+      timeout.stop();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

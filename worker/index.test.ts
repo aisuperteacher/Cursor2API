@@ -1701,8 +1701,9 @@ describe("Worker", () => {
 
     expect(response.status).toBe(200);
     const body = await response.text();
-    expect(body).toContain("event: error");
-    expect(body).toContain('"type":"error"');
+    expect(body).toContain("event: response.failed");
+    expect(body).toContain('"type":"response.failed"');
+    expect(body).toContain('"status":"failed"');
     expect(body).toContain('"sequence_number":0');
     expect(body).toContain("Too many computers used within the last 24 hours");
   });

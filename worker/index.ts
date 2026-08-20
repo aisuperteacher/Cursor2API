@@ -25,6 +25,7 @@ import {
   responseDeltaEvent,
   responseDoneEvents,
   responseErrorEvent,
+  responseFailedEvent,
   responseInputItemsObject,
   responseObject,
   responseTextStartEvents,
@@ -1097,7 +1098,13 @@ function streamOpenAiEvents(
       const message = error instanceof Error ? error.message : "Stream failed";
       await writer.write(
         kind === "responses"
-          ? responseErrorEvent(message)
+          ? responseFailedEvent({
+              id: input.id,
+              created: input.created,
+              model: input.model,
+              message,
+              metadata: input.metadata
+            })
           : encodeSse({ error: { message, type: "cursor_error", code: "cursor_stream_error" } }, "error")
       );
     } finally {

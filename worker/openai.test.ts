@@ -6,6 +6,7 @@ import {
   chatCompletionResponse,
   chatUsageChunk,
   responseErrorEvent,
+  responseFailedEvent,
   responseObject,
   toolCallRetryHint,
   toOpenAiToolCalls
@@ -26,6 +27,26 @@ describe("OpenAI compatibility adapter", () => {
         message: "Authentication error",
         param: null
       }
+    });
+  });
+
+
+  it("encodes Responses stream failures with a response.failed terminal event", () => {
+    const event = new TextDecoder().decode(responseFailedEvent({
+      id: "resp_test",
+      created: 123,
+      model: "composer-2.5",
+      message: "bridge timed out",
+      sequenceNumber: 9
+    }));
+    const data = JSON.parse(event.match(/^data: (.+)$/m)?.[1] ?? "{}");
+    expect(event).toContain("event: response.failed");
+    expect(data.type).toBe("response.failed");
+    expect(data.sequence_number).toBe(9);
+    expect(data.response).toMatchObject({
+      id: "resp_test",
+      status: "failed",
+      error: { code: "cursor_stream_error", message: "bridge timed out" }
     });
   });
 

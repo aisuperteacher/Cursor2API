@@ -169,6 +169,56 @@ describe("Cursor SDK harness", () => {
     expect(prompt).toContain("mappable tool_call");
     expect(prompt).toContain("allowed OpenCode tool inventory");
   });
+
+  it("requests NDJSON bridge events and yields text before the bridge run completes", async () => {
+    let requestBody: Record<string, unknown> | undefined;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const encoder = new TextEncoder();
+    const completion = await createCursorSdkCompletion(
+      { CURSOR_SDK_BRIDGE_URL: "http://bridge.test/sdk" } as any,
+      {
+        now: () => new Date("2026-08-20T00:00:00Z"),
+        randomUUID: () => crypto.randomUUID(),
+        fetch: async (_input, init) => {
+          requestBody = JSON.parse(String(init?.body || "{}"));
+          return new Response(new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(encoder.encode(`${JSON.stringify({ type: "text", text: "hel" })}\n`));
+              gate.then(() => {
+                controller.enqueue(encoder.encode(`${JSON.stringify({ type: "text", text: "lo" })}\n`));
+                controller.enqueue(encoder.encode(`${JSON.stringify({ type: "done", output: { text: "hello", toolCalls: [], status: "completed" } })}\n`));
+                controller.close();
+              });
+            }
+          }), { status: 200, headers: { "Content-Type": "application/x-ndjson" } });
+        }
+      },
+      "cursor-test-key",
+      {
+        prompt: { text: "Say hello" },
+        model: { id: "composer-2.5" },
+        sessionKey: "ndjson-stream"
+      }
+    );
+
+    const iterator = completion.stream[Symbol.asyncIterator]();
+    const first = await iterator.next();
+    expect(first).toMatchObject({ done: false, value: { type: "text", text: "hel" } });
+    expect(requestBody?.streamEvents).toBe(true);
+
+    release();
+    const events = [first.value];
+    for (;;) {
+      const next = await iterator.next();
+      if (next.done) break;
+      events.push(next.value);
+    }
+    expect(events.filter((event) => event?.type === "text").map((event) => event.text).join(""))
+      .toBe("hello");
+    expect(events.at(-1)).toMatchObject({ type: "done", finalText: "hello" });
+  });
+
 });
 
 function protoMessage(parts: Uint8Array[]): Uint8Array {
