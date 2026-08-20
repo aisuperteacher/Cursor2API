@@ -68,3 +68,5 @@ jobs:
           git add -A
           git commit -m 'fix: improve Claude Code bridge reliability'
           git push origin HEAD:fix/claude-code-bridge-reliability
+
+# retrigger after workflow exists on branch
