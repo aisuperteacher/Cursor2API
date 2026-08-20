@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - fix/claude-code-bridge-reliability
+  pull_request:
+    branches:
+      - fix/claude-code-bridge-reliability
 
 permissions:
   contents: write
@@ -16,6 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: fix/claude-code-bridge-reliability
           fetch-depth: 0
 
       - name: Set up Node
@@ -68,5 +72,3 @@ jobs:
           git add -A
           git commit -m 'fix: improve Claude Code bridge reliability'
           git push origin HEAD:fix/claude-code-bridge-reliability
-
-# retrigger after workflow exists on branch
