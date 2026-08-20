@@ -1,2 +1,2 @@
 trigger bridge reliability verification
-retry 2
+retry 3
