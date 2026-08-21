@@ -7,6 +7,7 @@ import {
   clientForwardingMcpServerSource,
   clientMcpToolDefinitions,
   composerToolCallFromText,
+  createRunAbortController,
   createRunTimeoutController,
   localAgentCreateOptions,
   localAgentSendOptions,
@@ -2044,4 +2045,50 @@ describe("Cursor SDK bridge deadlines", () => {
       vi.useRealTimers();
     }
   });
+
+  it("rejects an aborted bridge run and invokes its cancellation callback", async () => {
+    const controller = new AbortController();
+    let cancellations = 0;
+    const abort = createRunAbortController(controller.signal, () => {
+      cancellations += 1;
+    });
+
+    controller.abort(new Error("client disconnected"));
+    await expect(abort.promise).rejects.toMatchObject({ name: "AbortError", code: "ABORT_ERR" });
+    expect(cancellations).toBe(1);
+    abort.stop();
+  });
+
+  it("removes an aborted queued run without starting work for that client", async () => {
+    const input = {
+      apiKey: "test-key",
+      model: "default",
+      workingDirectory: "/tmp/project",
+      sessionKey: "abort-queue-session",
+      clientTools: []
+    };
+    let releaseFirst;
+    let firstStarted;
+    const started = new Promise((resolve) => { firstStarted = resolve; });
+    const first = runExclusiveForAgent(input, async () => {
+      firstStarted();
+      await new Promise((resolve) => { releaseFirst = resolve; });
+      return "first";
+    });
+    await started;
+
+    const controller = new AbortController();
+    let secondStarted = false;
+    const second = runExclusiveForAgent({ ...input, signal: controller.signal }, async () => {
+      secondStarted = true;
+      return "second";
+    });
+    controller.abort(new Error("client disconnected"));
+
+    await expect(second).rejects.toMatchObject({ name: "AbortError", code: "ABORT_ERR" });
+    expect(secondStarted).toBe(false);
+    releaseFirst();
+    await expect(first).resolves.toBe("first");
+  });
+
 });

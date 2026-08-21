@@ -219,6 +219,27 @@ describe("Cursor SDK harness", () => {
     expect(events.at(-1)).toMatchObject({ type: "done", finalText: "hello" });
   });
 
+  it("cancels the NDJSON bridge body when its consumer stops early", async () => {
+    let cancelled = false;
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(`${JSON.stringify({ type: "text", text: "first" })}\n`));
+      },
+      cancel() {
+        cancelled = true;
+      }
+    });
+
+    const iterator = cursorSdkTestExports.parseCursorLocalSdkBridgeNdjson(body);
+    await expect(iterator.next()).resolves.toMatchObject({
+      done: false,
+      value: { type: "text", text: "first" }
+    });
+    await iterator.return(undefined as never);
+    expect(cancelled).toBe(true);
+  });
+
 });
 
 function protoMessage(parts: Uint8Array[]): Uint8Array {

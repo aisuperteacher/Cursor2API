@@ -33,4 +33,30 @@ describe("AsyncStaleCache", () => {
     now = 60_001;
     await expect(cache.get("credential-a", async () => { throw new Error("429"); })).resolves.toEqual(["cached-model"]);
   });
+
+  test("does not serve or retain stale data after an authentication failure", async () => {
+    let now = 0;
+    let loads = 0;
+    const cache = new AsyncStaleCache<string[]>(60_000, () => now);
+
+    await expect(cache.get("credential-a", async () => {
+      loads += 1;
+      return ["cached-model"];
+    })).resolves.toEqual(["cached-model"]);
+
+    now = 60_001;
+    const unauthorized = Object.assign(new Error("unauthorized"), { status: 401 });
+    await expect(cache.get("credential-a", async () => {
+      loads += 1;
+      throw unauthorized;
+    })).rejects.toBe(unauthorized);
+    expect(loads).toBe(2);
+
+    await expect(cache.get("credential-a", async () => {
+      loads += 1;
+      return ["fresh-model"];
+    })).resolves.toEqual(["fresh-model"]);
+    expect(loads).toBe(3);
+  });
+
 });

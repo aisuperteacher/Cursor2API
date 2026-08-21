@@ -727,10 +727,14 @@ async function* parseCursorLocalSdkBridgeNdjson(body: ReadableStream<Uint8Array>
     return value;
   };
 
+  let completed = false;
   try {
     for (;;) {
       const { value, done } = await reader.read();
-      if (done) break;
+      if (done) {
+        completed = true;
+        break;
+      }
       buffer += decoder.decode(value, { stream: true });
       for (;;) {
         const newline = buffer.indexOf("\n");
@@ -745,6 +749,9 @@ async function* parseCursorLocalSdkBridgeNdjson(body: ReadableStream<Uint8Array>
     const parsed = parseLine(buffer);
     if (parsed) yield parsed;
   } finally {
+    if (!completed) {
+      await reader.cancel("cursor_sdk_bridge_consumer_closed").catch(() => undefined);
+    }
     reader.releaseLock();
   }
 }

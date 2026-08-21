@@ -75,4 +75,18 @@ describe("sidecar credential pool", () => {
     expect(isBillingError(new Error("Insufficient credit"))).toBe(true);
     expect(isBillingError(new Error("Rate limit temporarily unavailable"))).toBe(false);
   });
+
+  test("keeps the same session affinity pinned to the same first-choice credential", async () => {
+    const pool = new CursorCredentialPool([{ apiKey: "one" }, { apiKey: "two" }]);
+    const load = async (key: string) => catalogs[key];
+    const first = await pool.candidates("composer-2.5", "sticky-session", load);
+    expect(first).toHaveLength(2);
+    const pinnedId = first[0].id;
+
+    for (let turn = 0; turn < 6; turn += 1) {
+      const candidates = await pool.candidates("composer-2.5", "sticky-session", load);
+      expect(candidates[0].id).toBe(pinnedId);
+    }
+  });
+
 });

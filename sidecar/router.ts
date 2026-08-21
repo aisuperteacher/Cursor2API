@@ -33,7 +33,6 @@ interface EncryptedValue {
 
 export class CursorCredentialPool {
   readonly credentials: PoolCredential[];
-  private readonly rotation = new Map<string, number>();
   private readonly statePath?: string;
   private readonly encryptionKey?: Buffer;
 
@@ -113,8 +112,7 @@ export class CursorCredentialPool {
     if (eligible.length <= 1) return eligible;
 
     const key = `${modelId}:${affinity}`;
-    const start = this.rotation.get(key) ?? stableIndex(key, eligible.length);
-    this.rotation.set(key, (start + 1) % eligible.length);
+    const start = stableIndex(key, eligible.length);
     return [...eligible.slice(start), ...eligible.slice(0, start)];
   }
 

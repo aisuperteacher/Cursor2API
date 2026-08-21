@@ -58,6 +58,7 @@ export {
   isAuthenticationSDKError,
   isRetryableSDKRunError,
   composerToolCallFromText,
+  createRunAbortController,
   createRunTimeoutController,
   normalizeSDKToolCall,
   normalizeModel,
@@ -176,8 +177,12 @@ async function handleClientToolCallback(request, response) {
 
 async function streamLocalAgent(input, response) {
   let closed = false;
+  const abortController = new AbortController();
   const markClosed = () => {
     closed = true;
+    if (!abortController.signal.aborted) {
+      abortController.abort(new Error("Cursor SDK bridge client disconnected."));
+    }
   };
   const socket = response.socket;
   response.on("close", markClosed);
@@ -191,11 +196,11 @@ async function streamLocalAgent(input, response) {
   const emit = (event) => {
     if (closed) return false;
     const wrote = writeNdjson(response, event);
-    if (!wrote) closed = true;
+    if (!wrote) markClosed();
     return wrote;
   };
   try {
-    const output = await runLocalAgent(input, emit);
+    const output = await runLocalAgent({ ...input, signal: abortController.signal }, emit);
     emit({ type: "done", output });
   } catch (error) {
     emit({ type: "error", error: openAiError(error).error });
@@ -322,7 +327,48 @@ function createRunTimeoutController({
   };
 }
 
+function abortError(reason) {
+  const message = reason instanceof Error && reason.message
+    ? reason.message
+    : "Cursor SDK bridge client disconnected.";
+  const error = new Error(message);
+  error.name = "AbortError";
+  error.code = "ABORT_ERR";
+  return error;
+}
+
+function createRunAbortController(signal, onAbort) {
+  let stopped = false;
+  let rejectAbort;
+  const promise = new Promise((_resolve, reject) => {
+    rejectAbort = reject;
+  });
+  const abort = () => {
+    if (stopped) return;
+    stopped = true;
+    try {
+      onAbort?.();
+    } catch {}
+    rejectAbort(abortError(signal?.reason));
+  };
+
+  if (signal) {
+    if (signal.aborted) queueMicrotask(abort);
+    else signal.addEventListener("abort", abort, { once: true });
+  }
+
+  return {
+    promise,
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      signal?.removeEventListener("abort", abort);
+    }
+  };
+}
+
 async function runLocalAgentUnlocked(input, onEvent) {
+  if (input.signal?.aborted) throw abortError(input.signal.reason);
   for (let attempt = 0; ; attempt += 1) {
     let activeRun = null;
     let emittedOutputEvent = false;
@@ -338,17 +384,21 @@ async function runLocalAgentUnlocked(input, onEvent) {
         if (activeRun) activeRun.cancel().catch(() => {});
       }
     });
+    const abortControl = createRunAbortController(input.signal, () => {
+      if (activeRun) activeRun.cancel().catch(() => {});
+    });
     const progress = (kind) => {
       timeoutControl.progress(kind);
       if (onEvent) onEvent({ type: "progress", kind });
     };
     const work = runLocalAgentBody(input, (run) => {
       activeRun = run;
+      if (input.signal?.aborted) run.cancel().catch(() => {});
       progress("run_ready");
     }, emit, progress);
 
     try {
-      return await Promise.race([work, timeoutControl.promise]);
+      return await Promise.race([work, timeoutControl.promise, abortControl.promise]);
     } catch (error) {
       work.catch(() => {});
       const authenticationFailure = isAuthenticationSDKError(error);
@@ -365,6 +415,7 @@ async function runLocalAgentUnlocked(input, onEvent) {
       console.warn(`Retrying Cursor SDK run after ${authenticationFailure ? "authentication refresh" : "retryable upstream error"} (${attempt + 1}/${maxRunRetries}).`);
       await sleep(retryDelayMs(attempt));
     } finally {
+      abortControl.stop();
       timeoutControl.stop();
     }
   }
@@ -379,11 +430,14 @@ async function runExclusiveForAgent(input, work) {
   });
   const current = previous.catch(() => {}).then(() => gate);
   agentRunQueues.set(cacheKey, current);
+  const abortControl = createRunAbortController(input.signal);
 
   try {
-    await previous.catch(() => {});
+    await Promise.race([previous.catch(() => {}), abortControl.promise]);
+    if (input.signal?.aborted) throw abortError(input.signal.reason);
     return await work();
   } finally {
+    abortControl.stop();
     release();
     if (agentRunQueues.get(cacheKey) === current) {
       agentRunQueues.delete(cacheKey);

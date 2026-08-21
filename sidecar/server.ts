@@ -20,7 +20,7 @@
  * only need thin adapters between `node:http` messages and Web types.
  */
 
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, type IncomingMessage } from "node:http";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { extname, resolve, sep } from "node:path";
 
@@ -79,6 +79,7 @@ import {
 import { AsyncStaleCache } from "./async-stale-cache";
 import { AnthropicSessionLinkStore, preferCredential, type AnthropicContinuation } from "./anthropic-session";
 import { LocalAuthStore, sessionCookie, sessionToken } from "./auth";
+import { writeWebResponse } from "./node-response";
 
 const HOST = process.env.HOST?.trim() || "127.0.0.1";
 const DEFAULT_PORT = 8787;
@@ -395,8 +396,9 @@ async function liveCursorModels(apiKey: string): Promise<CursorCatalogModel[]> {
       } catch {
         // Keep the raw response text.
       }
-      const status = response.status === 401 ? 401 : response.status === 429 ? 429 : 502;
-      throw new HttpError(message, status, response.status === 401 ? "cursor_unauthorized" : "cursor_models_error");
+      const authenticationFailure = response.status === 401 || response.status === 403;
+      const status = authenticationFailure ? response.status : response.status === 429 ? 429 : 502;
+      throw new HttpError(message, status, authenticationFailure ? "cursor_unauthorized" : "cursor_models_error");
     }
 
     const payload = await response.json() as { models?: CursorCatalogModel[] };
@@ -1504,31 +1506,6 @@ function toWebRequest(req: IncomingMessage, port: number): Request {
     (init as { duplex?: string }).duplex = "half";
   }
   return new Request(url, init);
-}
-
-async function writeWebResponse(res: ServerResponse, response: Response): Promise<void> {
-  const headers: Record<string, string> = {};
-  response.headers.forEach((value, key) => {
-    headers[key] = value;
-  });
-  res.writeHead(response.status, headers);
-
-  if (!response.body) {
-    res.end();
-    return;
-  }
-
-  const reader = response.body.getReader();
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      if (value) res.write(Buffer.from(value));
-    }
-  } finally {
-    reader.releaseLock();
-    res.end();
-  }
 }
 
 // ---------------------------------------------------------------------------
