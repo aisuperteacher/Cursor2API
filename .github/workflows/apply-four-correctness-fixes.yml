@@ -1,0 +1,55 @@
+name: Apply four correctness fixes
+
+on:
+  push:
+    branches:
+      - fix/claude-code-bridge-reliability
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+          ref: fix/claude-code-bridge-reliability
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.9
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Apply scoped correctness fixes
+        run: python3 scripts/apply-four-correctness-fixes.py
+
+      - name: Run Vitest suite
+        run: npm test
+
+      - name: Run sidecar tests
+        run: npm run test:sidecar
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Commit verified fixes and remove staging files
+        run: |
+          rm scripts/apply-four-correctness-fixes.py
+          rm .github/workflows/apply-four-correctness-fixes.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix: close remaining bridge reliability correctness gaps"
+          git push origin HEAD:fix/claude-code-bridge-reliability
