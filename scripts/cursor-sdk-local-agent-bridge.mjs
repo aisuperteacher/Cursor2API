@@ -56,6 +56,8 @@ export {
   localAgentSendOptions,
   isForwardableSDKToolCall,
   isAuthenticationSDKError,
+  bridgeRequiresToken,
+  isLoopbackHost,
   isRetryableSDKRunError,
   composerToolCallFromText,
   createRunAbortController,
@@ -71,8 +73,20 @@ export {
   toolCallFromDelta
 };
 
+function isLoopbackHost(value) {
+  const normalized = String(value || "").trim().toLowerCase().replace(/^\[(.*)\]$/, "$1");
+  return normalized === "localhost" || normalized === "::1" || /^127(?:\.\d{1,3}){3}$/.test(normalized);
+}
+
+function bridgeRequiresToken(hostValue, tokenValue) {
+  return !String(tokenValue || "").trim() && !isLoopbackHost(hostValue);
+}
+
 function startServer() {
   if (server) return server;
+  if (bridgeRequiresToken(host, bridgeToken)) {
+    throw new Error("CURSOR_SDK_BRIDGE_TOKEN is required when CURSOR_SDK_BRIDGE_HOST is not loopback");
+  }
   server = http.createServer((request, response) => {
     handleRequest(request, response).catch((error) => {
       writeJson(response, openAiError(error), statusFromError(error));

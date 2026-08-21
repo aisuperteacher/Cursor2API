@@ -35,6 +35,7 @@ import {
 } from "./openai";
 import { submitWaitlist } from "./waitlist";
 import { encodeSse } from "./sse";
+import { streamOpenAiEvents, streamOpenAiResponse } from "./openai-stream";
 import type { Deps, Env } from "./types";
 import type { CursorTextEvent } from "./cursor";
 import type { ToolCallContext } from "./openai";
@@ -623,6 +624,7 @@ async function handleOpenAiCompletion(
         tools: prepared.tools,
           context: prepared.toolContext,
           onBillingError,
+          isBillingError,
           onDone: async (text, completionChars, toolCalls) => {
           if (route.kind === "responses" && responseOwner) {
             const completed = responseObject({
@@ -727,10 +729,13 @@ async function handleSdkPreparedOpenAiRoute(input: {
   sdkSessionKey?: string;
   finishLog: (input: Parameters<typeof completeRequestLog>[2]) => Promise<void>;
 }): Promise<Response> {
+  const reusableSessionKey = input.sdkSessionKey || sessionAffinity(input.request);
+  const sdkSessionKey = reusableSessionKey || `request-${input.deps.randomUUID()}`;
   const completion = await createCursorSdkCompletion(input.env, input.deps, input.auth.cursorApiKey, {
     prompt: input.prepared.prompt,
     model: input.prepared.cursorModel,
-    sessionKey: input.sdkSessionKey || sessionAffinity(input.request),
+    sessionKey: sdkSessionKey,
+    incrementalPrompt: reusableSessionKey ? input.prepared.incrementalPrompt : undefined,
     sessionOwnerKey: sdkSessionOwner(input.auth),
     workingDirectory: input.prepared.toolContext?.workingDirectory,
     clientTools: input.prepared.tools,
@@ -759,6 +764,7 @@ async function handleSdkPreparedOpenAiRoute(input: {
       tools: input.prepared.tools,
       context: input.prepared.toolContext,
       onBillingError: input.onBillingError,
+      isBillingError,
       onDone: async (text, completionChars, toolCalls) => {
         if (input.route.kind === "responses" && input.responseOwner) {
           const completed = responseObject({
@@ -917,6 +923,7 @@ async function handleOpenCodeSdkChatRoute(
         tools: prepared.tools,
         context: prepared.toolContext,
         onBillingError,
+        isBillingError,
         onDone: (_text, completionChars) =>
           finishLog({
             status: "completed",
@@ -966,153 +973,6 @@ async function handleOpenCodeSdkChatRoute(
     }).catch(() => undefined);
     throw error;
   }
-}
-
-function streamOpenAiResponse(
-  kind: "chat" | "responses",
-  cursorStream: Response,
-  input: {
-    id: string;
-    created: number;
-    model: string;
-    promptChars: number;
-    includeUsage: boolean;
-    metadata?: Record<string, unknown>;
-    tools: OpenAiToolSpec[];
-    context?: ToolCallContext;
-    onBillingError?: (error: unknown) => Promise<void>;
-    onDone: (text: string, completionChars: number, toolCalls: ReturnType<typeof toOpenAiToolCalls>) => Promise<void>;
-    onError: (error: unknown) => Promise<void>;
-  },
-  ctx: ExecutionContext
-): Response {
-  return streamOpenAiEvents(kind, streamCursorText(cursorStream), input, ctx);
-}
-
-function streamOpenAiEvents(
-  kind: "chat" | "responses",
-  cursorEvents: AsyncIterable<CursorTextEvent>,
-  input: {
-    id: string;
-    created: number;
-    model: string;
-    promptChars: number;
-    includeUsage: boolean;
-    metadata?: Record<string, unknown>;
-    tools: OpenAiToolSpec[];
-    context?: ToolCallContext;
-    onBillingError?: (error: unknown) => Promise<void>;
-    onDone: (text: string, completionChars: number, toolCalls: ReturnType<typeof toOpenAiToolCalls>) => Promise<void>;
-    onError: (error: unknown) => Promise<void>;
-  },
-  ctx: ExecutionContext
-): Response {
-  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
-  const writer = writable.getWriter();
-  const pump = async () => {
-    let text = "";
-    let toolCallCount = 0;
-    let finishReason: "stop" | "tool_calls" = "stop";
-    const streamedToolCalls: ReturnType<typeof toOpenAiToolCalls> = [];
-    let responseNextOutputIndex = 0;
-    let responseTextOutputIndex: number | null = null;
-    try {
-      if (kind === "chat") {
-        await writer.write(chatChunk({ id: input.id, created: input.created, model: input.model, role: "assistant" }));
-      } else {
-        for (const event of responseCreatedEvents(input)) await writer.write(event);
-      }
-
-      for await (const event of cursorEvents) {
-        if (event.type === "text" && event.text) {
-          text += event.text;
-          if (kind === "chat") await writer.write(chatChunk({ id: input.id, created: input.created, model: input.model, delta: event.text }));
-          else {
-            if (responseTextOutputIndex === null) {
-              responseTextOutputIndex = responseNextOutputIndex;
-              responseNextOutputIndex += 1;
-              for (const chunk of responseTextStartEvents({ id: input.id, outputIndex: responseTextOutputIndex })) await writer.write(chunk);
-            }
-            await writer.write(responseDeltaEvent({ id: input.id, delta: event.text, outputIndex: responseTextOutputIndex }));
-          }
-        }
-        if (event.type === "tool_call") {
-          const [toolCall] = toOpenAiToolCalls({
-            toolCalls: [event.toolCall],
-            tools: input.tools,
-            responseId: input.id,
-            startIndex: toolCallCount,
-            context: input.context
-          });
-          if (!toolCall) continue;
-          finishReason = "tool_calls";
-          streamedToolCalls.push(toolCall);
-          if (kind === "chat") {
-            await writer.write(chatChunk({ id: input.id, created: input.created, model: input.model, toolCall: { index: toolCallCount, value: toolCall } }));
-          } else {
-            for (const chunk of responseToolCallEvents({ id: input.id, toolCall, outputIndex: responseNextOutputIndex })) await writer.write(chunk);
-            responseNextOutputIndex += 1;
-          }
-          toolCallCount += 1;
-        }
-        if (event.type === "done") {
-          text = event.finalText;
-        }
-      }
-
-      if (kind === "chat") {
-        const completionChars = completionCharsFromOutput(text, streamedToolCalls);
-        await writer.write(chatChunk({ id: input.id, created: input.created, model: input.model, finish: true, finishReason }));
-        if (input.includeUsage) {
-          await writer.write(
-            chatUsageChunk({
-              id: input.id,
-              created: input.created,
-              model: input.model,
-              promptChars: input.promptChars,
-              completionChars
-            })
-          );
-        }
-        await writer.write(doneChunk());
-      } else {
-        if (responseTextOutputIndex === null && !streamedToolCalls.length) {
-          responseTextOutputIndex = responseNextOutputIndex;
-          responseNextOutputIndex += 1;
-          for (const chunk of responseTextStartEvents({ id: input.id, outputIndex: responseTextOutputIndex })) await writer.write(chunk);
-        }
-        for (const event of responseDoneEvents({
-          ...input,
-          text,
-          toolCalls: streamedToolCalls,
-          textStarted: responseTextOutputIndex !== null,
-          textOutputIndex: responseTextOutputIndex ?? 0
-        })) await writer.write(event);
-      }
-      await input.onDone(text, completionCharsFromOutput(text, streamedToolCalls), streamedToolCalls);
-    } catch (error) {
-      if (input.onBillingError && isBillingError(error)) {
-        await input.onBillingError(error).catch(() => undefined);
-      }
-      await input.onError(error);
-      const message = error instanceof Error ? error.message : "Stream failed";
-      await writer.write(
-        kind === "responses"
-          ? responseFailedEvent({
-              id: input.id,
-              created: input.created,
-              model: input.model,
-              message,
-              metadata: input.metadata
-            })
-          : encodeSse({ error: { message, type: "cursor_error", code: "cursor_stream_error" } }, "error")
-      );
-    } finally {
-      await writer.close().catch(() => undefined);
-    }
-  };
-  ctx.waitUntil(pump());
-  return sseResponse(readable);
 }
 
 function sessionAffinity(request: Request): string | undefined {

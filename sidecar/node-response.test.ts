@@ -53,4 +53,14 @@ describe("sidecar node response streaming", () => {
     expect(cancelled).toBe(true);
     expect(Buffer.concat(res.writes).toString("utf8")).toBe("first");
   });
+
+  test("adds conservative browser security headers", async () => {
+    const res = new FakeResponse();
+    await writeWebResponse(res as any, new Response(null, { status: 204 }));
+    expect(res.headers["x-content-type-options"]).toBe("nosniff");
+    expect(res.headers["x-frame-options"]).toBe("DENY");
+    expect(res.headers["referrer-policy"]).toBe("no-referrer");
+    expect(res.headers["permissions-policy"]).toContain("camera=()");
+  });
+
 });

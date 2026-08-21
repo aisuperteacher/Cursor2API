@@ -1,5 +1,12 @@
 import type { ServerResponse } from "node:http";
 
+const SECURITY_HEADERS: Record<string, string> = {
+  "permissions-policy": "camera=(), microphone=(), geolocation=()",
+  "referrer-policy": "no-referrer",
+  "x-content-type-options": "nosniff",
+  "x-frame-options": "DENY"
+};
+
 function waitForDrainOrClose(res: ServerResponse): Promise<void> {
   if (res.destroyed) return Promise.resolve();
   return new Promise((resolve) => {
@@ -18,6 +25,7 @@ export async function writeWebResponse(res: ServerResponse, response: Response):
   response.headers.forEach((value, key) => {
     headers[key] = value;
   });
+  Object.assign(headers, SECURITY_HEADERS);
   res.writeHead(response.status, headers);
 
   if (!response.body) {
@@ -38,17 +46,13 @@ export async function writeWebResponse(res: ServerResponse, response: Response):
       if (clientClosed) break;
       const { value, done } = await reader.read();
       if (done || clientClosed) break;
-      if (value && !res.write(Buffer.from(value))) {
-        await waitForDrainOrClose(res);
-      }
+      if (value && !res.write(Buffer.from(value))) await waitForDrainOrClose(res);
     }
   } catch (error) {
     if (!clientClosed) throw error;
   } finally {
     res.off("close", onClose);
-    if (clientClosed) {
-      await reader.cancel("downstream client disconnected").catch(() => undefined);
-    }
+    if (clientClosed) await reader.cancel("downstream client disconnected").catch(() => undefined);
     reader.releaseLock();
     if (!res.writableEnded && !res.destroyed) res.end();
   }

@@ -4069,4 +4069,39 @@ describe("OpenAI compatibility adapter", () => {
     expect(toolCalls[0].function.name).toBe("shell");
     expect(JSON.parse(toolCalls[0].function.arguments)).toEqual({ command: "pwd" });
   });
+
+  it("builds a schema-free incremental prompt for cached Agent continuations", () => {
+    const largeSchema = {
+      type: "object",
+      properties: Object.fromEntries(
+        Array.from({ length: 200 }, (_, index) => [`field_${index}`, { type: "string", description: "x".repeat(200) }])
+      )
+    };
+    const prepared = prepareChatRequest(
+      {
+        model: "composer-2.5",
+        messages: [
+          { role: "user", content: "Inspect the project" },
+          {
+            role: "assistant",
+            content: "",
+            tool_calls: [{ id: "call_1", type: "function", function: { name: "inspect", arguments: "{}" } }]
+          },
+          { role: "tool", tool_call_id: "call_1", name: "inspect", content: "package.json: ok" },
+          { role: "user", content: "Continue with the result." }
+        ],
+        tools: [{ type: "function", function: { name: "inspect", description: "Inspect files", parameters: largeSchema } }]
+      },
+      { id: "composer-2.5" }
+    );
+
+    expect(prepared.incrementalPrompt).toBeDefined();
+    expect(prepared.prompt.text).toContain("CLIENT TOOL INVENTORY:");
+    expect(prepared.incrementalPrompt?.text).toContain("TOOL RESULT (name=inspect tool_call_id=call_1): package.json: ok");
+    expect(prepared.incrementalPrompt?.text).toContain("USER: Continue with the result.");
+    expect(prepared.incrementalPrompt?.text).not.toContain("CLIENT TOOL INVENTORY:");
+    expect(prepared.incrementalPrompt?.text).not.toContain("field_199");
+    expect(prepared.incrementalPrompt!.text.length).toBeLessThan(prepared.prompt.text.length / 10);
+  });
+
 });

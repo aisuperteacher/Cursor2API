@@ -12,6 +12,8 @@ import {
   localAgentCreateOptions,
   localAgentSendOptions,
   isAuthenticationSDKError,
+  bridgeRequiresToken,
+  isLoopbackHost,
   isForwardableSDKToolCall,
   isRetryableSDKRunError,
   normalizeModel,
@@ -2089,6 +2091,24 @@ describe("Cursor SDK bridge deadlines", () => {
     expect(secondStarted).toBe(false);
     releaseFirst();
     await expect(first).resolves.toBe("first");
+  });
+
+
+  it("only permits tokenless bridge binding on loopback interfaces", () => {
+    expect(isLoopbackHost("127.0.0.1")).toBe(true);
+    expect(isLoopbackHost("127.0.0.42")).toBe(true);
+    expect(isLoopbackHost("localhost")).toBe(true);
+    expect(isLoopbackHost("::1")).toBe(true);
+    expect(isLoopbackHost("0.0.0.0")).toBe(false);
+    expect(isLoopbackHost("192.168.1.10")).toBe(false);
+    expect(isLoopbackHost("::")).toBe(false);
+  });
+
+  it("requires a bridge token for non-loopback binding", () => {
+    expect(bridgeRequiresToken("0.0.0.0", "")).toBe(true);
+    expect(bridgeRequiresToken("::", "")).toBe(true);
+    expect(bridgeRequiresToken("0.0.0.0", "bridge-secret")).toBe(false);
+    expect(bridgeRequiresToken("127.0.0.1", "")).toBe(false);
   });
 
 });

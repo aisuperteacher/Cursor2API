@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LocalAuthStore } from "./auth";
+import { LocalAuthStore, sessionCookie } from "./auth";
 
 describe("local auth store", () => {
   test("persists client key hashes and revokes keys", () => {
@@ -22,4 +22,16 @@ describe("local auth store", () => {
     expect(restored.revokeClientKey(created.info.id)).toBe(true);
     expect(restored.clientKey(created.token)).toBe(false);
   });
+
+  test("fails closed when an existing auth state file is corrupted", () => {
+    const statePath = join(mkdtempSync(join(tmpdir(), "cursor2api-auth-corrupt-")), "auth.json");
+    writeFileSync(statePath, "{not-json", "utf8");
+    expect(() => new LocalAuthStore(statePath)).toThrow("not valid JSON");
+  });
+
+  test("adds Secure to administrator cookies when TLS is active", () => {
+    expect(sessionCookie("token", 60, true)).toContain("; Secure");
+    expect(sessionCookie("token", 60, false)).not.toContain("; Secure");
+  });
+
 });

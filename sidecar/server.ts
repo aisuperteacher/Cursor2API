@@ -79,7 +79,9 @@ import {
 import { AsyncStaleCache } from "./async-stale-cache";
 import { AnthropicSessionLinkStore, preferCredential, type AnthropicContinuation } from "./anthropic-session";
 import { LocalAuthStore, sessionCookie, sessionToken } from "./auth";
+import { LoginAttemptLimiter } from "./login-limiter";
 import { writeWebResponse } from "./node-response";
+import { streamOpenAiEvents, streamOpenAiResponse } from "../worker/openai-stream";
 
 const HOST = process.env.HOST?.trim() || "127.0.0.1";
 const DEFAULT_PORT = 8787;
@@ -132,6 +134,11 @@ const credentialPool = new CursorCredentialPool(
 const authStatePath = process.env.LOCAL_AUTH_STATE_PATH?.trim()
   || (process.env.CURSOR_ROUTER_STATE_PATH?.trim() || ".cursor2api/router-state.json") + ".auth";
 const authStore = new LocalAuthStore(authStatePath, process.env.ADMIN_PASSWORD || "");
+const loginLimiter = new LoginAttemptLimiter(
+  Number.parseInt(process.env.ADMIN_LOGIN_MAX_FAILURES || "5", 10) || 5,
+  Number.parseInt(process.env.ADMIN_LOGIN_WINDOW_MS || "900000", 10) || 900_000,
+  Number.parseInt(process.env.ADMIN_LOGIN_LOCKOUT_MS || "900000", 10) || 900_000
+);
 const anthropicSessionLinks = new AnthropicSessionLinkStore();
 
 /**
@@ -481,6 +488,28 @@ function configuredPublicBaseUrl(): string {
   return authStore.publicBaseUrl() || (process.env.PUBLIC_BASE_URL || "").trim().replace(/\/+$/, "");
 }
 
+function trustProxyHeaders(): boolean {
+  return (process.env.TRUST_PROXY_HEADERS || "").trim().toLowerCase() === "true";
+}
+
+function requestUsesTls(request: Request): boolean {
+  if (new URL(request.url).protocol === "https:") return true;
+  if (configuredPublicBaseUrl().toLowerCase().startsWith("https://")) return true;
+  if (!trustProxyHeaders()) return false;
+  const forwardedProto = (request.headers.get("x-forwarded-proto") || "").split(",")[0].trim().toLowerCase();
+  return forwardedProto === "https";
+}
+
+function loginIdentity(request: Request): string {
+  if (trustProxyHeaders()) {
+    const forwarded = request.headers.get("cf-connecting-ip")
+      || request.headers.get("x-real-ip")
+      || (request.headers.get("x-forwarded-for") || "").split(",")[0];
+    if (forwarded?.trim()) return forwarded.trim();
+  }
+  return request.headers.get("x-cursor2api-remote-address") || "unknown";
+}
+
 function publicApiBaseUrl(request: Request): string {
   const configured = configuredPublicBaseUrl();
   return (configured || new URL(request.url).origin) + "/v1";
@@ -509,21 +538,37 @@ async function handleAuthSetup(request: Request): Promise<Response> {
   const password = typeof body.password === "string" ? body.password : "";
   const token = authStore.setup(password);
   if (!token) throw new HttpError("Password must contain at least 8 characters", 400, "invalid_request_error", "password");
-  return json({ configured: true, authenticated: true }, { headers: { "set-cookie": sessionCookie(token) } });
+  return json({ configured: true, authenticated: true }, {
+    headers: { "set-cookie": sessionCookie(token, undefined, requestUsesTls(request)) }
+  });
 }
 
 async function handleAuthLogin(request: Request): Promise<Response> {
   if (!authStore.isConfigured()) throw new HttpError("Set an administrator password before signing in", 409, "setup_required");
+  const identity = loginIdentity(request);
+  const retryAfter = loginLimiter.retryAfterSeconds(identity);
+  if (retryAfter > 0) {
+    return json(
+      { error: { message: "Too many administrator login attempts", type: "rate_limit_error", code: "rate_limit_exceeded" } },
+      { status: 429, headers: { "retry-after": String(retryAfter) } }
+    );
+  }
   const body = await request.json() as Record<string, unknown>;
   const password = typeof body.password === "string" ? body.password : "";
   const token = authStore.login(password);
-  if (!token) return unauthorized();
-  return json({ configured: true, authenticated: true }, { headers: { "set-cookie": sessionCookie(token) } });
+  if (!token) {
+    loginLimiter.recordFailure(identity);
+    return unauthorized();
+  }
+  loginLimiter.reset(identity);
+  return json({ configured: true, authenticated: true }, {
+    headers: { "set-cookie": sessionCookie(token, undefined, requestUsesTls(request)) }
+  });
 }
 
 function handleAuthLogout(request: Request): Response {
   authStore.revokeSession(sessionToken(request));
-  return json({ ok: true }, { headers: { "set-cookie": sessionCookie("", 0) } });
+  return json({ ok: true }, { headers: { "set-cookie": sessionCookie("", 0, requestUsesTls(request)) } });
 }
 
 async function handleSettings(request: Request): Promise<Response> {
@@ -674,7 +719,7 @@ async function handleChatCompletionsWithKey(
   const created = Math.floor(deps.now().getTime() / 1000);
 
   if (hasSdkBridge()) {
-    return handleSdkRoute("chat", request, prepared, apiKey, id, created, chatIncrementalPrompt(body, cursorModel), onBillingError);
+    return handleSdkRoute("chat", request, prepared, apiKey, id, created, prepared.incrementalPrompt, onBillingError);
   }
 
   const completion = await createCursorCompletion(env, deps, apiKey, {
@@ -848,35 +893,6 @@ function retryingSdkStream(
   };
 }
 
-/**
- * The incremental "new turn" for a follow-up chat request: every message after the last
- * assistant message. Returned as a CursorPrompt so a still-cached SDK agent receives only
- * the new turn instead of the whole conversation. Undefined on the first turn (no prior
- * assistant) — then the bridge uses the full prompt.
- */
-function chatIncrementalPrompt(
-  body: unknown,
-  cursorModel: { id: string }
-): ReturnType<typeof prepareChatRequest>["prompt"] | undefined {
-  const messages = (body as { messages?: Array<{ role?: string }> } | null)?.messages;
-  if (!Array.isArray(messages) || messages.length === 0) return undefined;
-  let lastAssistant = -1;
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    if (messages[i]?.role === "assistant") {
-      lastAssistant = i;
-      break;
-    }
-  }
-  if (lastAssistant < 0 || lastAssistant >= messages.length - 1) return undefined;
-  const tail = messages.slice(lastAssistant + 1);
-  try {
-    const deltaBody = { ...(body as Record<string, unknown>), messages: tail, stream: false };
-    return prepareChatRequest(deltaBody as Parameters<typeof prepareChatRequest>[0], cursorModel).prompt;
-  } catch {
-    return undefined;
-  }
-}
-
 /** Shared tool-call gate for the SDK paths (OpenAI + Anthropic): allow a tool call only
  * if it maps to a known client tool, else return a retry hint string. */
 function sdkAllowToolCall(prepared: PreparedRequest, toolCall: CursorToolCall) {
@@ -952,7 +968,7 @@ async function handleAnthropicMessagesWithKey(
   const reused = credentialPinned;
   const baseSessionKey = reused ? continuation!.link.sessionKey : `cc-${crypto.randomUUID()}`;
   if (continuation && !reused) anthropicSessionLinks.clearSession(continuation.link.sessionKey);
-  const incrementalPrompt = reused ? chatIncrementalPrompt(translatedBody, cursorModel) : undefined;
+  const incrementalPrompt = reused ? prepared.incrementalPrompt : undefined;
   let activeSessionKey = baseSessionKey;
 
   console.info(JSON.stringify({
@@ -1043,7 +1059,7 @@ async function handleSdkRoute(
   apiKey: string,
   id: string,
   created: number,
-  incrementalPrompt?: ReturnType<typeof prepareChatRequest>["prompt"],
+  incrementalPrompt?: PreparedRequest["incrementalPrompt"],
   onBillingError?: (error: unknown) => void
 ): Promise<Response> {
   logToolForwarding(kind, prepared);
@@ -1159,152 +1175,6 @@ function handleResponseState(request: Request, responseId: string): Response {
     return json({ id: responseId, object: "response", deleted: true });
   }
   return notFound();
-}
-
-// ---------------------------------------------------------------------------
-// Streaming glue. This mirrors `streamOpenAiEvents` from `worker/index.ts` but
-// runs the pump directly (no `ExecutionContext.waitUntil`) and skips the
-// request-log bookkeeping that only exists on the hosted proxy path.
-// ---------------------------------------------------------------------------
-
-interface StreamInput {
-  id: string;
-  created: number;
-  model: string;
-  promptChars: number;
-  includeUsage: boolean;
-  metadata?: Record<string, unknown>;
-  tools: OpenAiToolSpec[];
-  context?: ToolCallContext;
-  onDone?: (text: string, completionChars: number, toolCalls: OpenAiToolCall[]) => void;
-  onError?: (error: unknown) => void | Promise<void>;
-}
-
-function streamOpenAiResponse(kind: "chat" | "responses", cursorStream: Response, input: StreamInput): Response {
-  return streamOpenAiEvents(kind, streamCursorText(cursorStream), input);
-}
-
-function streamOpenAiEvents(
-  kind: "chat" | "responses",
-  cursorEvents: AsyncIterable<CursorTextEvent>,
-  input: StreamInput
-): Response {
-  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
-  const writer = writable.getWriter();
-  const pump = async () => {
-    let text = "";
-    let toolCallCount = 0;
-    let finishReason: "stop" | "tool_calls" = "stop";
-    const streamedToolCalls: OpenAiToolCall[] = [];
-    let responseNextOutputIndex = 0;
-    let responseTextOutputIndex: number | null = null;
-    try {
-      if (kind === "chat") {
-        await writer.write(chatChunk({ id: input.id, created: input.created, model: input.model, role: "assistant" }));
-      } else {
-        for (const event of responseCreatedEvents(input)) await writer.write(event);
-      }
-
-      for await (const event of cursorEvents) {
-        if (event.type === "text" && event.text) {
-          text += event.text;
-          if (kind === "chat") {
-            await writer.write(chatChunk({ id: input.id, created: input.created, model: input.model, delta: event.text }));
-          } else {
-            if (responseTextOutputIndex === null) {
-              responseTextOutputIndex = responseNextOutputIndex;
-              responseNextOutputIndex += 1;
-              for (const chunk of responseTextStartEvents({ id: input.id, outputIndex: responseTextOutputIndex })) {
-                await writer.write(chunk);
-              }
-            }
-            await writer.write(responseDeltaEvent({ id: input.id, delta: event.text, outputIndex: responseTextOutputIndex }));
-          }
-        }
-        if (event.type === "tool_call") {
-          const [toolCall] = toOpenAiToolCalls({
-            toolCalls: [event.toolCall],
-            tools: input.tools,
-            responseId: input.id,
-            startIndex: toolCallCount,
-            context: input.context
-          });
-          if (!toolCall) continue;
-          finishReason = "tool_calls";
-          streamedToolCalls.push(toolCall);
-          if (kind === "chat") {
-            await writer.write(
-              chatChunk({ id: input.id, created: input.created, model: input.model, toolCall: { index: toolCallCount, value: toolCall } })
-            );
-          } else {
-            for (const chunk of responseToolCallEvents({ id: input.id, toolCall, outputIndex: responseNextOutputIndex })) {
-              await writer.write(chunk);
-            }
-            responseNextOutputIndex += 1;
-          }
-          toolCallCount += 1;
-        }
-        if (event.type === "done") {
-          text = event.finalText;
-        }
-      }
-
-      if (kind === "chat") {
-        const completionChars = completionCharsFromOutput(text, streamedToolCalls);
-        await writer.write(chatChunk({ id: input.id, created: input.created, model: input.model, finish: true, finishReason }));
-        if (input.includeUsage) {
-          await writer.write(
-            chatUsageChunk({
-              id: input.id,
-              created: input.created,
-              model: input.model,
-              promptChars: input.promptChars,
-              completionChars
-            })
-          );
-        }
-        await writer.write(doneChunk());
-      } else {
-        if (responseTextOutputIndex === null && !streamedToolCalls.length) {
-          responseTextOutputIndex = responseNextOutputIndex;
-          responseNextOutputIndex += 1;
-          for (const chunk of responseTextStartEvents({ id: input.id, outputIndex: responseTextOutputIndex })) {
-            await writer.write(chunk);
-          }
-        }
-        for (const event of responseDoneEvents({
-          ...input,
-          text,
-          toolCalls: streamedToolCalls,
-          textStarted: responseTextOutputIndex !== null,
-          textOutputIndex: responseTextOutputIndex ?? 0
-        })) {
-          await writer.write(event);
-        }
-      }
-      input.onDone?.(text, completionCharsFromOutput(text, streamedToolCalls), streamedToolCalls);
-    } catch (error) {
-      await input.onError?.(error);
-      const message = error instanceof Error ? error.message : "Stream failed";
-      await writer
-        .write(
-          kind === "responses"
-            ? responseFailedEvent({
-                id: input.id,
-                created: input.created,
-                model: input.model,
-                message,
-                metadata: input.metadata
-              })
-            : encodeSse({ error: { message, type: "cursor_error", code: "cursor_stream_error" } }, "error")
-        )
-        .catch(() => undefined);
-    } finally {
-      await writer.close().catch(() => undefined);
-    }
-  };
-  void pump();
-  return sseResponse(readable);
 }
 
 function staticContentType(filePath: string): string {
@@ -1471,6 +1341,7 @@ function toWebRequest(req: IncomingMessage, port: number): Request {
       headers.set(key, value);
     }
   }
+  headers.set("x-cursor2api-remote-address", req.socket.remoteAddress || "unknown");
 
   const init: RequestInit = { method, headers };
   if (method !== "GET" && method !== "HEAD") {

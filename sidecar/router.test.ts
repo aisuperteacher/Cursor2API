@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CursorCredentialPool, canonicalModelId, isBillingError, parseCursorCredentialEnv } from "./router";
@@ -87,6 +87,20 @@ describe("sidecar credential pool", () => {
       const candidates = await pool.candidates("composer-2.5", "sticky-session", load);
       expect(candidates[0].id).toBe(pinnedId);
     }
+  });
+
+
+  test("fails closed instead of resetting a corrupted credential store", () => {
+    const statePath = join(mkdtempSync(join(tmpdir(), "cursor2api-router-corrupt-")), "state.json");
+    writeFileSync(statePath, "{not-json", "utf8");
+    expect(() => new CursorCredentialPool([], statePath, "secret")).toThrow("not valid JSON");
+  });
+
+  test("requires the encryption key when managed credentials are present", () => {
+    const statePath = join(mkdtempSync(join(tmpdir(), "cursor2api-router-key-")), "state.json");
+    const managed = new CursorCredentialPool([], statePath, "secret");
+    managed.addCredential("crsr_managed", "managed");
+    expect(() => new CursorCredentialPool([], statePath)).toThrow("ENCRYPTION_KEY is required");
   });
 
 });
