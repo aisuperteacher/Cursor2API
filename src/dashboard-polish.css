@@ -75,12 +75,7 @@
   color: #aeb7c5;
 }
 
-.console-shell:not(:has(#connection:target))
-  :not(:has(#credentials:target))
-  :not(:has(#usage:target))
-  :not(:has(#request-logs:target))
-  :not(:has(#client-keys:target))
-  .console-nav a[href="#overview"],
+.console-shell:not(:has(#connection:target)):not(:has(#credentials:target)):not(:has(#usage:target)):not(:has(#request-logs:target)):not(:has(#client-keys:target)) .console-nav a[href="#overview"],
 .console-shell:has(#overview:target) .console-nav a[href="#overview"],
 .console-shell:has(#connection:target) .console-nav a[href="#connection"],
 .console-shell:has(#credentials:target) .console-nav a[href="#credentials"],
