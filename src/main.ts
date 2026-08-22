@@ -6,15 +6,33 @@ const isDashboardRoute = (): boolean => window.location.pathname.replace(/\/+$/,
 const dashboardHashes = new Set(["#overview", "#connection", "#credentials", "#usage", "#request-logs", "#client-keys"]);
 let dashboardNavObserver: MutationObserver | null = null;
 
+function normalizedDashboardHash(hash = window.location.hash): string {
+  return dashboardHashes.has(hash) ? hash : "#overview";
+}
+
 function syncDashboardNav(hash = window.location.hash): void {
   if (!isDashboardRoute()) return;
-  const activeHash = dashboardHashes.has(hash) ? hash : "#overview";
+  const activeHash = normalizedDashboardHash(hash);
+  const navigation = document.querySelector<HTMLElement>(".console-nav");
+  navigation?.setAttribute("data-active-section", activeHash.slice(1));
+
   document.querySelectorAll<HTMLAnchorElement>(".console-nav a[href^='#']").forEach((anchor) => {
     const active = anchor.getAttribute("href") === activeHash;
     anchor.classList.toggle("is-active", active);
     if (active) anchor.setAttribute("aria-current", "page");
     else anchor.removeAttribute("aria-current");
+
+    // Inline important styles are intentional here. They make the selected state
+    // deterministic even when a browser still has an older dashboard stylesheet in
+    // memory while a newly deployed, fingerprinted JavaScript bundle is loading.
+    anchor.style.setProperty("background", active ? "rgba(99, 102, 241, 0.18)" : "transparent", "important");
+    anchor.style.setProperty("color", active ? "#fff" : "#aeb7c5", "important");
   });
+}
+
+function scrollToDashboardHash(hash = window.location.hash): void {
+  const target = document.querySelector<HTMLElement>(normalizedDashboardHash(hash));
+  target?.scrollIntoView({ block: "start" });
 }
 
 function watchDashboardNav(root: HTMLElement): void {
@@ -78,7 +96,10 @@ document.addEventListener("click", (event) => {
   const href = anchor.getAttribute("href") || "";
 
   if (isDashboardRoute() && anchor.closest(".console-nav") && dashboardHashes.has(href)) {
+    event.preventDefault();
+    if (window.location.hash !== href) window.history.pushState({}, "", href);
     syncDashboardNav(href);
+    scrollToDashboardHash(href);
     return;
   }
 
@@ -91,8 +112,18 @@ document.addEventListener("click", (event) => {
   }
 });
 
-window.addEventListener("hashchange", () => syncDashboardNav());
-window.addEventListener("popstate", () => void route());
+window.addEventListener("hashchange", () => {
+  syncDashboardNav();
+  scrollToDashboardHash();
+});
+window.addEventListener("popstate", () => {
+  if (isDashboardRoute()) {
+    syncDashboardNav();
+    scrollToDashboardHash();
+    return;
+  }
+  void route();
+});
 
 let landingReady = false;
 
