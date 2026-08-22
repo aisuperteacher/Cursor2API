@@ -13,6 +13,7 @@ async function route(): Promise<void> {
     chatRoot.hidden = false;
     document.title = "Dashboard - API for Cursor";
     const { mountDashboard } = await import("./dashboard");
+    await import("./dashboard-polish.css");
     mountDashboard(chatRoot);
     return;
   }
