@@ -16,6 +16,7 @@ export interface PoolCredential {
   status: "active" | "disabled";
   disabledReason?: string;
   managed: boolean;
+  environment: boolean;
 }
 
 interface RouterState {
@@ -31,6 +32,13 @@ interface EncryptedValue {
   tag: string;
 }
 
+interface SharedPoolState {
+  credentials: PoolCredential[];
+  encryptionKeyDigest: string;
+}
+
+const sharedPools = new Map<string, SharedPoolState>();
+
 export class CursorRouterStateError extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, options);
@@ -38,48 +46,78 @@ export class CursorRouterStateError extends Error {
   }
 }
 
+export type DeleteCredentialResult = "deleted" | "not_found" | "unmanaged";
+
 export class CursorCredentialPool {
   readonly credentials: PoolCredential[];
   private readonly statePath?: string;
   private readonly encryptionKey?: Buffer;
 
   constructor(keys: Array<{ apiKey: string; label?: string }>, statePath?: string, encryptionSecret?: string) {
-    const state = readRouterState(statePath);
+    this.statePath = statePath;
     this.encryptionKey = encryptionSecret?.trim()
       ? createHash("sha256").update(encryptionSecret.trim()).digest()
       : undefined;
+
+    const existing = statePath ? sharedPools.get(statePath) : undefined;
+    if (existing) {
+      if (existing.credentials.some((credential) => credential.managed) && !this.encryptionKey) {
+        throw new CursorRouterStateError("ENCRYPTION_KEY is required to load managed Cursor credentials");
+      }
+      if (
+        existing.encryptionKeyDigest
+        && this.encryptionKey
+        && existing.encryptionKeyDigest !== encryptionKeyDigest(this.encryptionKey)
+      ) {
+        throw new CursorRouterStateError("ENCRYPTION_KEY does not match the already loaded managed Cursor credential store");
+      }
+      mergeConfiguredCredentials(existing.credentials, keys, readRouterState(statePath));
+      this.credentials = existing.credentials;
+      return;
+    }
+
+    const state = readRouterState(statePath);
     if (state.credentials.length && !this.encryptionKey) {
       throw new CursorRouterStateError("ENCRYPTION_KEY is required to load managed Cursor credentials");
     }
+
     const storedKeys = this.encryptionKey
       ? state.credentials.map((item) => {
           try {
-            return { apiKey: decryptValue(item.secret, this.encryptionKey!), label: item.label, managed: true };
+            return {
+              apiKey: decryptValue(item.secret, this.encryptionKey!),
+              label: item.label,
+              managed: true,
+              environment: false
+            };
           } catch (error) {
             throw new CursorRouterStateError(`Could not decrypt managed Cursor credential ${item.id}`, { cause: error });
           }
         })
       : [];
-    const unique = new Map<string, { apiKey: string; label?: string }>();
-    const managedKeys = new Set(storedKeys.map((item) => item.apiKey));
-    for (const item of [...keys, ...storedKeys]) {
+
+    const unique = new Map<string, { apiKey: string; label?: string; managed: boolean; environment: boolean }>();
+    for (const item of keys) {
       const apiKey = item.apiKey.trim();
-      if (apiKey && !unique.has(apiKey)) unique.set(apiKey, { ...item, apiKey });
+      if (!apiKey || unique.has(apiKey)) continue;
+      unique.set(apiKey, { apiKey, label: item.label, managed: false, environment: true });
     }
-    this.credentials = [...unique.values()].map((item, index) => {
-      const id = credentialId(item.apiKey);
-      return {
-        id,
-        label: item.label?.trim() || `cursor-${index + 1}`,
-        apiKey: item.apiKey,
-        hint: item.apiKey.slice(-4),
-        disabledModels: new Set((state.disabledModels[id] || []).map(canonicalModelId)),
-        status: state.disabledCredentials[id] ? "disabled" : "active",
-        disabledReason: state.disabledCredentials[id],
-        managed: managedKeys.has(item.apiKey)
-      };
-    });
-    this.statePath = statePath;
+    for (const item of storedKeys) {
+      const existingItem = unique.get(item.apiKey);
+      if (existingItem) {
+        existingItem.managed = true;
+      } else {
+        unique.set(item.apiKey, item);
+      }
+    }
+
+    this.credentials = [...unique.values()].map((item, index) => credentialFrom(item, index, state));
+    if (statePath) {
+      sharedPools.set(statePath, {
+        credentials: this.credentials,
+        encryptionKeyDigest: this.encryptionKey ? encryptionKeyDigest(this.encryptionKey) : ""
+      });
+    }
   }
 
   async intersectModels<T extends PoolCatalogModel>(load: (apiKey: string) => Promise<T[]>): Promise<T[]> {
@@ -149,7 +187,8 @@ export class CursorCredentialPool {
       hint: normalized.slice(-4),
       disabledModels: new Set(),
       status: "active",
-      managed: true
+      managed: true,
+      environment: false
     };
     this.credentials.push(credential);
     this.persist();
@@ -165,8 +204,34 @@ export class CursorCredentialPool {
     return true;
   }
 
+  enableCredential(id: string): boolean {
+    const credential = this.credentials.find((item) => item.id === id);
+    if (!credential) return false;
+    credential.status = "active";
+    credential.disabledReason = undefined;
+    this.persist();
+    return true;
+  }
+
+  deleteCredential(id: string): DeleteCredentialResult {
+    const index = this.credentials.findIndex((item) => item.id === id);
+    if (index < 0) return "not_found";
+    if (this.credentials[index].environment || !this.credentials[index].managed) return "unmanaged";
+    this.credentials.splice(index, 1);
+    this.persist();
+    return "deleted";
+  }
+
+  credentialForApiKey(apiKey: string): PoolCredential | undefined {
+    return this.credentials.find((credential) => credential.apiKey === apiKey);
+  }
+
   private persist(): void {
     if (!this.statePath) return;
+    const managed = this.credentials.filter((credential) => credential.managed);
+    if (managed.length && !this.encryptionKey) {
+      throw new CursorRouterStateError("ENCRYPTION_KEY is required to persist managed Cursor credentials");
+    }
     const state: RouterState = {
       version: 2,
       disabledModels: Object.fromEntries(
@@ -180,14 +245,12 @@ export class CursorCredentialPool {
           .map((credential) => [credential.id, credential.disabledReason || "disabled"])
       ),
       credentials: this.encryptionKey
-        ? this.credentials
-            .filter((credential) => credential.managed)
-            .map((credential) => ({
-              id: credential.id,
-              label: credential.label,
-              secret: encryptValue(credential.apiKey, this.encryptionKey!)
-            }))
-        : [],
+        ? managed.map((credential) => ({
+            id: credential.id,
+            label: credential.label,
+            secret: encryptValue(credential.apiKey, this.encryptionKey!)
+          }))
+        : []
     };
     try {
       writePrivateJsonAtomic(this.statePath, state);
@@ -254,12 +317,47 @@ export function isBillingError(error: unknown): boolean {
   ].some((marker) => text.includes(marker));
 }
 
+function mergeConfiguredCredentials(
+  target: PoolCredential[],
+  keys: Array<{ apiKey: string; label?: string }>,
+  state: RouterState
+): void {
+  for (const item of keys) {
+    const apiKey = item.apiKey.trim();
+    if (!apiKey || target.some((credential) => credential.apiKey === apiKey)) continue;
+    target.push(credentialFrom({ apiKey, label: item.label, managed: false, environment: true }, target.length, state));
+  }
+}
+
+function credentialFrom(
+  item: { apiKey: string; label?: string; managed: boolean; environment: boolean },
+  index: number,
+  state: RouterState
+): PoolCredential {
+  const id = credentialId(item.apiKey);
+  return {
+    id,
+    label: item.label?.trim() || `cursor-${index + 1}`,
+    apiKey: item.apiKey,
+    hint: item.apiKey.slice(-4),
+    disabledModels: new Set((state.disabledModels[id] || []).map(canonicalModelId)),
+    status: state.disabledCredentials[id] ? "disabled" : "active",
+    disabledReason: state.disabledCredentials[id],
+    managed: item.managed,
+    environment: item.environment
+  };
+}
+
 function modelSupports(model: PoolCatalogModel, requestedModel: string): boolean {
   return [model.id, ...(model.aliases || [])].map(canonicalModelId).includes(requestedModel);
 }
 
 function credentialId(apiKey: string): string {
   return `cred_${createHash("sha256").update(apiKey).digest("hex").slice(0, 24)}`;
+}
+
+function encryptionKeyDigest(key: Buffer): string {
+  return createHash("sha256").update(key).digest("hex");
 }
 
 function readRouterState(statePath?: string): RouterState {
