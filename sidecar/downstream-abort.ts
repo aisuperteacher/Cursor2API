@@ -3,7 +3,11 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 
 const downstreamSignalContext = new AsyncLocalStorage<AbortSignal>();
 
-export type DownstreamDisconnectReason = "response_close" | "request_aborted" | "socket_close";
+export type DownstreamDisconnectReason =
+  | "response_close"
+  | "request_aborted"
+  | "socket_end"
+  | "socket_close";
 
 export function combineAbortSignals(
   first?: AbortSignal | null,
@@ -30,11 +34,14 @@ export function combineAbortSignals(
 }
 
 /**
- * Bind a request-scoped AbortController to every reliable downstream disconnect
- * signal exposed by node:http. `ServerResponse.close` is not emitted consistently
- * when a client disconnects before response headers are flushed, so the underlying
- * socket close is the authoritative fallback. Listeners are removed on normal
- * response completion to avoid leaking onto keep-alive sockets.
+ * Bind a request-scoped AbortController to downstream disconnect signals exposed
+ * by node:http/net.Socket.
+ *
+ * The important detail is the socket `end` event: when a client closes its read
+ * side with a TCP FIN while the server still has a streaming response open, Node
+ * may surface `end` before `close` (and `close` can be delayed until the server
+ * also closes its side). Waiting only for `close` leaves the upstream SDK run
+ * alive. Treat `end` as a downstream disconnect for an unfinished response.
  */
 export function bindDownstreamAbort(
   request: IncomingMessage,
@@ -50,6 +57,7 @@ export function bindDownstreamAbort(
     response.off("close", onResponseClose);
     response.off("finish", onResponseFinish);
     request.off("aborted", onRequestAborted);
+    request.socket.off("end", onSocketEnd);
     request.socket.off("close", onSocketClose);
   };
 
@@ -71,11 +79,13 @@ export function bindDownstreamAbort(
   const onResponseClose = () => abortDownstream("response_close");
   const onResponseFinish = () => cleanup();
   const onRequestAborted = () => abortDownstream("request_aborted");
+  const onSocketEnd = () => abortDownstream("socket_end");
   const onSocketClose = () => abortDownstream("socket_close");
 
   response.once("close", onResponseClose);
   response.once("finish", onResponseFinish);
   request.once("aborted", onRequestAborted);
+  request.socket.once("end", onSocketEnd);
   request.socket.once("close", onSocketClose);
 
   return cleanup;
