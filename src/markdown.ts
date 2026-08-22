@@ -235,20 +235,33 @@ function languageLabel(lang: string): string {
   return lang || "text";
 }
 
+/** Reverse the entity encoding applied by escapeHtml so hrefs can be re-encoded exactly once. */
+function unescapeHtml(value: string): string {
+  return value
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&quot;", "\"")
+    .replaceAll("&#039;", "'")
+    .replaceAll("&amp;", "&");
+}
+
 function renderInline(value: string): string {
+  // The link regexes run on already-escaped text, so hrefs arrive with their &
+  // (and friends) entity-encoded; decode before escapeAttr or query strings like
+  // ?a=1&b=2 end up double-encoded and broken in the browser.
   let text = escapeHtml(value);
   text = text.replace(/`([^`]+)`/g, "<code>$1</code>");
   text = text.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
   text = text.replace(
     /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
     (_match, label: string, href: string) =>
-      `<a href="${escapeAttr(href)}" target="_blank" rel="noreferrer">${label}</a>`
+      `<a href="${escapeAttr(unescapeHtml(href))}" target="_blank" rel="noreferrer">${label}</a>`
   );
   text = text.replace(
     /\[([^\]]+)\]((?:\((?:\/|#)[^)\s]*\)))/g,
     (_match, label: string, wrappedHref: string) => {
       const href = wrappedHref.slice(1, -1);
-      return `<a href="${escapeAttr(href)}">${label}</a>`;
+      return `<a href="${escapeAttr(unescapeHtml(href))}">${label}</a>`;
     }
   );
   return text;

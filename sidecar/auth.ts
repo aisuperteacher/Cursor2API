@@ -18,6 +18,13 @@ interface AuthState {
   publicBaseUrl?: string;
 }
 
+interface SharedAuthState {
+  state: AuthState;
+  sessions: Map<string, number>;
+}
+
+const sharedAuthStates = new Map<string, SharedAuthState>();
+
 export interface ClientKeyInfo {
   id: string;
   label: string;
@@ -32,67 +39,95 @@ export class LocalAuthStateError extends Error {
   }
 }
 
+const SESSION_PRUNE_INTERVAL_MS = 10 * 60 * 1000;
+
 export class LocalAuthStore {
   private readonly statePath: string;
   private readonly configuredClientKeyHash: string;
-  private state: AuthState;
-  private readonly sessions = new Map<string, number>();
+  private readonly shared: SharedAuthState;
+  private lastSessionPruneAt = 0;
 
   constructor(statePath: string, configuredAdminPassword = "", configuredClientKey = "") {
     this.statePath = statePath;
     this.configuredClientKeyHash = configuredClientKey.trim() ? hashToken(configuredClientKey.trim()) : "";
-    this.state = readState(statePath);
-    if (configuredAdminPassword.trim() && !this.state.adminPasswordHash) {
-      this.state.adminPasswordHash = hashPassword(configuredAdminPassword.trim());
+    const existing = sharedAuthStates.get(statePath);
+    this.shared = existing || { state: readState(statePath), sessions: new Map<string, number>() };
+    if (!existing) sharedAuthStates.set(statePath, this.shared);
+    if (configuredAdminPassword.trim() && !this.shared.state.adminPasswordHash) {
+      this.shared.state.adminPasswordHash = hashPassword(configuredAdminPassword.trim());
       this.persist();
     }
   }
 
   isConfigured(): boolean {
-    return Boolean(this.state.adminPasswordHash);
+    return Boolean(this.shared.state.adminPasswordHash);
   }
 
   setup(password: string): string | null {
     if (this.isConfigured() || !validPassword(password)) return null;
-    this.state.adminPasswordHash = hashPassword(password);
+    this.shared.state.adminPasswordHash = hashPassword(password);
     this.persist();
     return this.createSession();
   }
 
   login(password: string): string | null {
-    if (!this.state.adminPasswordHash || !verifyPassword(password, this.state.adminPasswordHash)) return null;
+    if (!this.shared.state.adminPasswordHash || !verifyPassword(password, this.shared.state.adminPasswordHash)) return null;
     return this.createSession();
   }
 
   createSession(): string {
+    this.pruneSessions();
     const token = randomBytes(32).toString("base64url");
-    this.sessions.set(token, Date.now() + 1000 * 60 * 60 * 24 * 7);
+    this.shared.sessions.set(token, Date.now() + 1000 * 60 * 60 * 24 * 7);
     return token;
   }
 
   isSessionValid(token: string): boolean {
-    const expiresAt = this.sessions.get(token);
+    this.pruneSessions();
+    const expiresAt = this.shared.sessions.get(token);
     if (!expiresAt || expiresAt < Date.now()) {
-      this.sessions.delete(token);
+      this.shared.sessions.delete(token);
       return false;
     }
     return true;
   }
 
+  /** Drop expired session entries now and then so long-running processes do not accumulate them. */
+  private pruneSessions(): void {
+    const now = Date.now();
+    if (now - this.lastSessionPruneAt < SESSION_PRUNE_INTERVAL_MS) return;
+    this.lastSessionPruneAt = now;
+    for (const [token, expiresAt] of this.shared.sessions) {
+      if (expiresAt < now) this.shared.sessions.delete(token);
+    }
+  }
+
   revokeSession(token: string): void {
-    this.sessions.delete(token);
+    this.shared.sessions.delete(token);
   }
 
   clientKey(token: string): boolean {
+    return Boolean(this.resolveClientKey(token));
+  }
+
+  resolveClientKey(token: string): ClientKeyInfo | null {
     const candidate = token.trim();
-    if (!candidate) return false;
+    if (!candidate) return null;
     const digest = hashToken(candidate);
-    if (this.configuredClientKeyHash && safeHexEqual(digest, this.configuredClientKeyHash)) return true;
-    return this.state.clientKeys.some((item) => safeHexEqual(item.hash, digest));
+    if (this.configuredClientKeyHash && safeHexEqual(digest, this.configuredClientKeyHash)) {
+      return {
+        id: "configured",
+        label: "configured",
+        hint: candidate.slice(-6),
+        createdAt: ""
+      };
+    }
+    const item = this.shared.state.clientKeys.find((entry) => safeHexEqual(entry.hash, digest));
+    return item ? { id: item.id, label: item.label, hint: item.hint, createdAt: item.createdAt } : null;
   }
 
   listClientKeys(): ClientKeyInfo[] {
-    return this.state.clientKeys.map(({ id, label, hint, createdAt }) => ({ id, label, hint, createdAt }));
+    return this.shared.state.clientKeys.map(({ id, label, hint, createdAt }) => ({ id, label, hint, createdAt }));
   }
 
   createClientKey(label = "Default"): { token: string; info: ClientKeyInfo } {
@@ -103,33 +138,33 @@ export class LocalAuthStore {
       hint: token.slice(-6),
       createdAt: new Date().toISOString()
     };
-    this.state.clientKeys.push({ ...info, hash: hashToken(token) });
+    this.shared.state.clientKeys.push({ ...info, hash: hashToken(token) });
     this.persist();
     return { token, info };
   }
 
   revokeClientKey(id: string): boolean {
-    const before = this.state.clientKeys.length;
-    this.state.clientKeys = this.state.clientKeys.filter((item) => item.id !== id);
-    if (this.state.clientKeys.length === before) return false;
+    const before = this.shared.state.clientKeys.length;
+    this.shared.state.clientKeys = this.shared.state.clientKeys.filter((item) => item.id !== id);
+    if (this.shared.state.clientKeys.length === before) return false;
     this.persist();
     return true;
   }
 
   publicBaseUrl(): string {
-    return this.state.publicBaseUrl || "";
+    return this.shared.state.publicBaseUrl || "";
   }
 
   setPublicBaseUrl(value: string): string {
     const normalized = value.trim().replace(/\/+$/, "").replace(/\/v1$/, "");
-    this.state.publicBaseUrl = normalized;
+    this.shared.state.publicBaseUrl = normalized;
     this.persist();
     return normalized;
   }
 
   private persist(): void {
     try {
-      writePrivateJsonAtomic(this.statePath, this.state);
+      writePrivateJsonAtomic(this.statePath, this.shared.state);
     } catch (error) {
       throw new LocalAuthStateError(`Could not persist local auth state at ${this.statePath}`, { cause: error });
     }
@@ -141,7 +176,10 @@ export function sessionCookie(token: string, maxAge = 60 * 60 * 24 * 7, secure =
 }
 
 export function sessionToken(request: Request): string {
-  const raw = request.headers.get("cookie") || "";
+  return sessionTokenFromCookie(request.headers.get("cookie") || "");
+}
+
+export function sessionTokenFromCookie(raw: string): string {
   const match = /(?:^|;\s*)cursor2api_session=([^;]+)/.exec(raw);
   return match ? decodeURIComponent(match[1]) : "";
 }
@@ -200,16 +238,19 @@ function validPassword(password: string): boolean {
   return password.trim().length >= 8;
 }
 
+// Hashing and verification both operate on the trimmed password so a setup-time
+// value with surrounding whitespace still verifies when typed without it (the
+// length check in validPassword already ignores that whitespace).
 function hashPassword(password: string): string {
   const salt = randomBytes(16).toString("hex");
-  const hash = scryptSync(password, salt, 32).toString("hex");
+  const hash = scryptSync(password.trim(), salt, 32).toString("hex");
   return `scrypt$${salt}$${hash}`;
 }
 
 function verifyPassword(password: string, encoded: string): boolean {
   const [, salt, expected] = encoded.split("$");
   if (!salt || !expected) return false;
-  const actual = scryptSync(password, salt, 32);
+  const actual = scryptSync(password.trim(), salt, 32);
   const target = Buffer.from(expected, "hex");
   return target.length === actual.length && timingSafeEqual(target, actual);
 }

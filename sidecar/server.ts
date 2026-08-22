@@ -20,7 +20,11 @@
  * only need thin adapters between `node:http` messages and Web types.
  */
 
-import { createServer, type IncomingMessage } from "node:http";
+// Import the module object (not the named `createServer` binding): server-entry.ts
+// installs the control-console runtime by patching `http.createServer`, and a named
+// import would snapshot the original function before that patch lands — which is
+// exactly what happens on Bun, silently disabling the observability routes.
+import http, { type IncomingMessage } from "node:http";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { extname, resolve, sep } from "node:path";
 
@@ -529,13 +533,29 @@ function normalizePublicBaseUrl(value: string): string {
   return parsed.toString().replace(/\/$/, "").replace(/\/v1$/i, "");
 }
 
+/** Parse any JSON body, mapping malformed input to a 400 instead of a 500. */
+async function readJson(request: Request): Promise<unknown> {
+  const text = await request.text();
+  try {
+    return text.trim() ? JSON.parse(text) : {};
+  } catch {
+    throw new HttpError("Request body must be valid JSON", 400, "invalid_request_error");
+  }
+}
+
+/** Parse a JSON object body, mapping malformed input to a 400 instead of a 500. */
+async function readJsonObject(request: Request): Promise<Record<string, unknown>> {
+  const body = await readJson(request);
+  return body && typeof body === "object" && !Array.isArray(body) ? body as Record<string, unknown> : {};
+}
+
 async function handleAuthStatus(request: Request): Promise<Response> {
   return json({ configured: authStore.isConfigured(), authenticated: hasAdminSession(request) });
 }
 
 async function handleAuthSetup(request: Request): Promise<Response> {
   if (authStore.isConfigured()) throw new HttpError("Administrator password is already configured", 409, "conflict");
-  const body = await request.json() as Record<string, unknown>;
+  const body = await readJsonObject(request);
   const password = typeof body.password === "string" ? body.password : "";
   const token = authStore.setup(password);
   if (!token) throw new HttpError("Password must contain at least 8 characters", 400, "invalid_request_error", "password");
@@ -554,7 +574,7 @@ async function handleAuthLogin(request: Request): Promise<Response> {
       { status: 429, headers: { "retry-after": String(retryAfter) } }
     );
   }
-  const body = await request.json() as Record<string, unknown>;
+  const body = await readJsonObject(request);
   const password = typeof body.password === "string" ? body.password : "";
   const token = authStore.login(password);
   if (!token) {
@@ -576,7 +596,7 @@ async function handleSettings(request: Request): Promise<Response> {
   if (!hasAdminSession(request)) return unauthorized();
   if (request.method === "GET") return json({ publicBaseUrl: configuredPublicBaseUrl(), baseUrl: publicApiBaseUrl(request) });
   if (request.method === "PUT") {
-    const body = await request.json() as Record<string, unknown>;
+    const body = await readJsonObject(request);
     const value = typeof body.publicBaseUrl === "string" ? body.publicBaseUrl : "";
     const publicBaseUrl = authStore.setPublicBaseUrl(normalizePublicBaseUrl(value));
     return json({ publicBaseUrl, baseUrl: publicApiBaseUrl(request) });
@@ -588,7 +608,7 @@ async function handleClientKeys(request: Request, keyId = ""): Promise<Response>
   if (!hasAdminSession(request)) return unauthorized();
   if (request.method === "GET" && !keyId) return json({ data: authStore.listClientKeys() });
   if (request.method === "POST" && !keyId) {
-    const body = await request.json() as Record<string, unknown>;
+    const body = await readJsonObject(request);
     const label = typeof body.label === "string" ? body.label : "Default";
     const created = authStore.createClientKey(label);
     return json({ ...created.info, token: created.token }, { status: 201 });
@@ -630,7 +650,7 @@ async function handleLocalCredentials(request: Request, credentialId = ""): Prom
 
   if (request.method === "POST" && !credentialId) {
     assertManagedCredentialStore();
-    const body = await request.json() as Record<string, unknown>;
+    const body = await readJsonObject(request);
     const cursorApiKey = typeof body.cursorApiKey === "string" ? body.cursorApiKey.trim() : "";
     const label = typeof body.label === "string" ? body.label.trim() : "Imported";
     if (!cursorApiKey) throw new HttpError("Cursor API key is required", 400, "invalid_request_error", "cursorApiKey");
@@ -699,7 +719,7 @@ async function routeCredentialRequest(
 }
 
 async function handleChatCompletions(request: Request): Promise<Response> {
-  const body = await request.json();
+  const body = await readJson(request);
   const requestedModel = typeof (body as { model?: unknown })?.model === "string" ? (body as { model: string }).model : PRIMARY_MODEL;
   return routeCredentialRequest(request, requestedModel, (apiKey, onBillingError) => (
     handleChatCompletionsWithKey(request, body, requestedModel, apiKey, onBillingError)
@@ -762,7 +782,7 @@ async function handleChatCompletionsWithKey(
 }
 
 async function handleResponses(request: Request): Promise<Response> {
-  const body = await request.json();
+  const body = await readJson(request);
   const requestedModel = typeof (body as { model?: unknown })?.model === "string" ? (body as { model: string }).model : PRIMARY_MODEL;
   return routeCredentialRequest(request, requestedModel, (apiKey, onBillingError) => (
     handleResponsesWithKey(request, body, requestedModel, apiKey, onBillingError)
@@ -945,7 +965,7 @@ function anthropicSseResponse(
 }
 
 async function handleAnthropicMessages(request: Request): Promise<Response> {
-  const body = await request.json();
+  const body = await readJson(request);
   const requestedModel =
     body && typeof body === "object" && typeof (body as { model?: unknown }).model === "string"
       ? (body as { model: string }).model
@@ -1056,7 +1076,7 @@ async function handleAnthropicMessagesWithKey(
  * same client API-key authorization as `/v1/messages`. */
 async function handleCountTokens(request: Request): Promise<Response> {
   if (!resolveAccess(request)) return unauthorized();
-  const body = await request.json();
+  const body = await readJson(request);
   const translatedBody = anthropicToChatBody(body);
   const prepared = prepareChatRequest(translatedBody, await cursorModelSelection(mapModel(""), translatedBody));
   return json({ input_tokens: estimateTokens(prepared.promptChars) });
@@ -1213,11 +1233,15 @@ function serveStatic(request: Request, pathname: string): Response {
   const filePath = resolve(STATIC_DIR, `.${requested}`);
   if (filePath !== STATIC_DIR && !filePath.startsWith(`${STATIC_DIR}${sep}`)) return notFound();
   if (!existsSync(filePath) || !statSync(filePath).isFile()) return notFound();
+  // index.html must revalidate so deploys take effect; everything under /assets/
+  // carries a content hash in its file name and can be cached forever.
   const headers = new Headers({
     "content-type": staticContentType(filePath),
-    "cache-control": requested === "/index.html" || /\.(?:css|js|map)$/.test(requested)
+    "cache-control": requested === "/index.html"
       ? "no-cache"
-      : "public, max-age=3600"
+      : requested.startsWith("/assets/")
+        ? "public, max-age=31536000, immutable"
+        : "public, max-age=3600"
   });
   const body = request.method === "HEAD" ? null : new Uint8Array(readFileSync(filePath));
   return new Response(body, { headers });
@@ -1402,7 +1426,7 @@ function parsePort(): number {
 
 function main(): void {
   const port = parsePort();
-  const server = createServer((req, res) => {
+  const server = http.createServer((req, res) => {
     const controller = new AbortController();
     bindDownstreamAbort(req, res, controller, (reason) => {
       console.info(JSON.stringify({

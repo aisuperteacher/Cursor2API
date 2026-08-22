@@ -494,6 +494,54 @@ async function resolveCursorImages(images: CursorImage[], deps: Deps): Promise<E
   return encoded;
 }
 
+const IMAGE_FETCH_TIMEOUT_MS = 10_000;
+// Download cap while streaming; the final MAX_CURSOR_IMAGE_BYTES check still applies.
+const IMAGE_DOWNLOAD_LIMIT_BYTES = 4 * 1024 * 1024;
+
+function isBlockedImageHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) return true;
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (v4) {
+    const [a, b] = v4.slice(1, 3).map(Number);
+    return (
+      a === 127 || a === 10 || a === 0 || (a === 169 && b === 254)
+      || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)
+      || (a === 100 && b >= 64 && b <= 127)
+    );
+  }
+  if (host === "::1" || host.startsWith("fc") || host.startsWith("fd") || host.startsWith("fe80:") || host.startsWith("::ffff:")) return true;
+  return false;
+}
+
+async function readBodyWithLimit(response: Response, limit: number): Promise<Uint8Array> {
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > limit) {
+    throw new HttpError("Image input is too large. Resize images to 1024px or less and keep each image under 1MB.", 400, "invalid_request_error", "image_url");
+  }
+  const reader = response.body?.getReader();
+  if (!reader) return new Uint8Array(await response.arrayBuffer());
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value?.byteLength ?? 0;
+    if (total > limit) {
+      await reader.cancel().catch(() => undefined);
+      throw new HttpError("Image input is too large. Resize images to 1024px or less and keep each image under 1MB.", 400, "invalid_request_error", "image_url");
+    }
+    if (value) chunks.push(value);
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
 async function fetchImageBytes(url: string, deps: Deps): Promise<Uint8Array> {
   let parsed: URL;
   try {
@@ -504,7 +552,15 @@ async function fetchImageBytes(url: string, deps: Deps): Promise<Uint8Array> {
   if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
     throw new HttpError("Image URL must use http or https.", 400, "invalid_request_error", "image_url");
   }
-  const response = await deps.fetch(parsed.toString(), { method: "GET" });
+  // Client-supplied URLs must not be used to probe loopback/private/metadata
+  // endpoints behind the gateway.
+  if (isBlockedImageHost(parsed.hostname)) {
+    throw new HttpError("Image URL must point to a public host.", 400, "invalid_request_error", "image_url");
+  }
+  const response = await deps.fetch(parsed.toString(), {
+    method: "GET",
+    signal: AbortSignal.timeout(IMAGE_FETCH_TIMEOUT_MS)
+  });
   if (!response.ok) {
     throw new HttpError(`Could not fetch image URL (${response.status}).`, 400, "invalid_request_error", "image_url");
   }
@@ -512,7 +568,7 @@ async function fetchImageBytes(url: string, deps: Deps): Promise<Uint8Array> {
   if (contentType && !contentType.toLowerCase().startsWith("image/")) {
     throw new HttpError("Image URL did not return an image content type.", 400, "invalid_request_error", "image_url");
   }
-  return new Uint8Array(await response.arrayBuffer());
+  return readBodyWithLimit(response, IMAGE_DOWNLOAD_LIMIT_BYTES);
 }
 
 function encodeImageProto(image: EncodedCursorImage): Uint8Array {

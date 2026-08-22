@@ -32,7 +32,10 @@ const STATE_PATH = path.join(RUNTIME_DIR, "state.json");
 const CONFIG_PATH = path.join(RUNTIME_DIR, "config.json");
 const CLIENT_INDEX = path.join(repoRoot, "dist", "client", "index.html");
 const BRIDGE_SCRIPT = path.join(repoRoot, "scripts", "cursor-sdk-local-agent-bridge.mjs");
-const SIDECAR_SCRIPT = path.join(repoRoot, "sidecar", "server.ts");
+// server-entry.ts installs the control-console runtime (observability routes,
+// request metadata logging) before importing the API server. Running server.ts
+// directly skips that install and leaves /api/usage and /api/request-logs on 404.
+const SIDECAR_SCRIPT = path.join(repoRoot, "sidecar", "server-entry.ts");
 
 function usage() {
   console.log(`cursor2api local server
@@ -343,7 +346,10 @@ async function cmdStart(flags) {
     ADMIN_PASSWORD: process.env.ADMIN_PASSWORD || "",
     LOCAL_AUTH_STATE_PATH: path.join(RUNTIME_DIR, "auth-state.json"),
     PUBLIC_BASE_URL: process.env.PUBLIC_BASE_URL || "",
-    STATIC_DIR: path.join(repoRoot, "dist", "client")
+    STATIC_DIR: path.join(repoRoot, "dist", "client"),
+    // Keep request logs next to the other local runtime state instead of the
+    // container-oriented /var/lib/api-for-cursor/logs default.
+    REQUEST_LOG_DIR: process.env.REQUEST_LOG_DIR || path.join(RUNTIME_DIR, "request-logs")
   };
 
   const sidecar = spawnLogged(
