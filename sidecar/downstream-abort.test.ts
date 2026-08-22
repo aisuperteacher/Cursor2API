@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { EventEmitter } from "node:events";
 
 import {
+  bindDownstreamAbort,
   combineAbortSignals,
   installDownstreamAwareFetch,
   runWithDownstreamSignal
@@ -14,6 +16,16 @@ afterEach(() => {
   delete (globalThis as typeof globalThis & Record<PropertyKey, unknown>)[marker];
 });
 
+class FakeSocket extends EventEmitter {}
+
+class FakeRequest extends EventEmitter {
+  socket = new FakeSocket();
+}
+
+class FakeResponse extends EventEmitter {
+  writableEnded = false;
+}
+
 describe("downstream abort propagation", () => {
   test("combined signal aborts when either source aborts", () => {
     const first = new AbortController();
@@ -23,6 +35,34 @@ describe("downstream abort propagation", () => {
     expect(combined?.aborted).toBe(false);
     second.abort(new Error("downstream closed"));
     expect(combined?.aborted).toBe(true);
+  });
+
+  test("socket close aborts an unfinished response even when response close is absent", () => {
+    const request = new FakeRequest();
+    const response = new FakeResponse();
+    const controller = new AbortController();
+    const reasons: string[] = [];
+
+    bindDownstreamAbort(request as any, response as any, controller, (reason) => reasons.push(reason));
+    request.socket.emit("close");
+
+    expect(controller.signal.aborted).toBe(true);
+    expect(reasons).toEqual(["socket_close"]);
+  });
+
+  test("normal response finish removes socket-close cancellation listeners", () => {
+    const request = new FakeRequest();
+    const response = new FakeResponse();
+    const controller = new AbortController();
+    const reasons: string[] = [];
+
+    bindDownstreamAbort(request as any, response as any, controller, (reason) => reasons.push(reason));
+    response.writableEnded = true;
+    response.emit("finish");
+    request.socket.emit("close");
+
+    expect(controller.signal.aborted).toBe(false);
+    expect(reasons).toEqual([]);
   });
 
   test("fetch started in a downstream context inherits the disconnect signal", async () => {
