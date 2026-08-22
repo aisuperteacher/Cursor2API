@@ -39,10 +39,13 @@ export class LocalAuthStateError extends Error {
   }
 }
 
+const SESSION_PRUNE_INTERVAL_MS = 10 * 60 * 1000;
+
 export class LocalAuthStore {
   private readonly statePath: string;
   private readonly configuredClientKeyHash: string;
   private readonly shared: SharedAuthState;
+  private lastSessionPruneAt = 0;
 
   constructor(statePath: string, configuredAdminPassword = "", configuredClientKey = "") {
     this.statePath = statePath;
@@ -73,18 +76,30 @@ export class LocalAuthStore {
   }
 
   createSession(): string {
+    this.pruneSessions();
     const token = randomBytes(32).toString("base64url");
     this.shared.sessions.set(token, Date.now() + 1000 * 60 * 60 * 24 * 7);
     return token;
   }
 
   isSessionValid(token: string): boolean {
+    this.pruneSessions();
     const expiresAt = this.shared.sessions.get(token);
     if (!expiresAt || expiresAt < Date.now()) {
       this.shared.sessions.delete(token);
       return false;
     }
     return true;
+  }
+
+  /** Drop expired session entries now and then so long-running processes do not accumulate them. */
+  private pruneSessions(): void {
+    const now = Date.now();
+    if (now - this.lastSessionPruneAt < SESSION_PRUNE_INTERVAL_MS) return;
+    this.lastSessionPruneAt = now;
+    for (const [token, expiresAt] of this.shared.sessions) {
+      if (expiresAt < now) this.shared.sessions.delete(token);
+    }
   }
 
   revokeSession(token: string): void {
@@ -223,16 +238,19 @@ function validPassword(password: string): boolean {
   return password.trim().length >= 8;
 }
 
+// Hashing and verification both operate on the trimmed password so a setup-time
+// value with surrounding whitespace still verifies when typed without it (the
+// length check in validPassword already ignores that whitespace).
 function hashPassword(password: string): string {
   const salt = randomBytes(16).toString("hex");
-  const hash = scryptSync(password, salt, 32).toString("hex");
+  const hash = scryptSync(password.trim(), salt, 32).toString("hex");
   return `scrypt$${salt}$${hash}`;
 }
 
 function verifyPassword(password: string, encoded: string): boolean {
   const [, salt, expected] = encoded.split("$");
   if (!salt || !expected) return false;
-  const actual = scryptSync(password, salt, 32);
+  const actual = scryptSync(password.trim(), salt, 32);
   const target = Buffer.from(expected, "hex");
   return target.length === actual.length && timingSafeEqual(target, actual);
 }

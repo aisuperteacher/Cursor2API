@@ -123,10 +123,18 @@ export class CursorCredentialPool {
   async intersectModels<T extends PoolCatalogModel>(load: (apiKey: string) => Promise<T[]>): Promise<T[]> {
     const active = this.credentials.filter((credential) => credential.status === "active");
     if (!active.length) return [];
-    const catalogs = await Promise.all(active.map(async (credential) => ({
-      credential,
-      models: await load(credential.apiKey)
-    })));
+    // A single dead or rate-limited key must not take the whole catalog endpoint
+    // down: skip credentials whose discovery fails and intersect the rest. Only
+    // when every credential fails do we surface the error, as before.
+    const settled = await Promise.all(active.map(async (credential) => {
+      try {
+        return { credential, models: await load(credential.apiKey), error: null as unknown };
+      } catch (error) {
+        return { credential, models: [] as T[], error };
+      }
+    }));
+    const catalogs = settled.filter((entry) => !entry.error);
+    if (!catalogs.length) throw settled[0].error;
     const first = catalogs[0];
     const shared = new Map(first.models.map((model) => [canonicalModelId(model.id), model]));
     for (const entry of catalogs.slice(1)) {

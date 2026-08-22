@@ -107,6 +107,10 @@ const LOG_FILE_PATTERN = /^requests(?:-\d+-\d+)?\.jsonl$/;
 const DEFAULT_QUERY_LIMIT = 10;
 const MAX_QUERY_LIMIT = 50;
 const USAGE_SAMPLE_LIMIT = 50_000;
+// usageSummary scans every retained log line, so serve a short-lived cached value
+// instead of re-scanning on each dashboard poll. Entries appended within the TTL
+// show up on the next refresh; clear() invalidates immediately.
+const USAGE_CACHE_TTL_MS = 30_000;
 
 export class RequestLogStore {
   readonly enabled: boolean;
@@ -122,6 +126,7 @@ export class RequestLogStore {
   private lastCleanupAt = 0;
   private rotateSequence = 0;
   private cleanupTimer?: ReturnType<typeof setInterval>;
+  private usageCache?: { expiresAt: number; value: GatewayUsageSummary };
 
   constructor(options: RequestLogOptions) {
     this.enabled = options.enabled !== false;
@@ -210,6 +215,7 @@ export class RequestLogStore {
 
   async usageSummary(): Promise<GatewayUsageSummary> {
     if (!this.enabled) return emptyUsageSummary(false);
+    if (this.usageCache && this.usageCache.expiresAt > this.now()) return this.usageCache.value;
     await this.queue;
     const entries: RequestLogEntry[] = [];
     let sampled = false;
@@ -230,7 +236,7 @@ export class RequestLogStore {
       if (sampled) break;
     }
 
-    if (!entries.length) return emptyUsageSummary(sampled);
+    if (!entries.length) return this.cacheUsage(emptyUsageSummary(sampled));
     const durations = entries.map((entry) => entry.durationMs);
     const byCredential = new Map<string, RequestLogEntry[]>();
     for (const entry of entries) {
@@ -240,7 +246,7 @@ export class RequestLogStore {
       byCredential.set(entry.credentialId, bucket);
     }
 
-    return {
+    return this.cacheUsage({
       retainedRequests: entries.length,
       completed: entries.filter((entry) => entry.result === "completed").length,
       failed: entries.filter((entry) => entry.result === "failed").length,
@@ -265,7 +271,12 @@ export class RequestLogStore {
           models: [...new Set(values.map((entry) => entry.model).filter((value): value is string => Boolean(value)))].sort()
         };
       }).sort((left, right) => right.requests - left.requests)
-    };
+    });
+  }
+
+  private cacheUsage(value: GatewayUsageSummary): GatewayUsageSummary {
+    this.usageCache = { expiresAt: this.now() + USAGE_CACHE_TTL_MS, value };
+    return value;
   }
 
   async stats(): Promise<RequestLogStorageStats> {
@@ -303,6 +314,7 @@ export class RequestLogStore {
       const files = await this.logFiles();
       await Promise.all(files.map((file) => unlink(file.path).catch(() => undefined)));
       this.lastCleanupAt = this.now();
+      this.usageCache = undefined;
     });
   }
 
