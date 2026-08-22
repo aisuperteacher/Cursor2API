@@ -1,5 +1,4 @@
 import http from "node:http";
-import { syncBuiltinESMExports } from "node:module";
 
 import {
   bindDownstreamAbort,
@@ -9,35 +8,41 @@ import {
 
 installDownstreamAwareFetch();
 
-const originalCreateServer = http.createServer.bind(http);
+// `server.ts` imports `createServer` as a named builtin binding. Replacing
+// `http.createServer` from this entry module is not reliable once Bun has bundled
+// that import, so bind cancellation at the stable boundary instead: the HTTP
+// server's request-event dispatch. This runs before any request handler code and
+// therefore propagates the request-scoped AbortSignal through the full async
+// chain via AsyncLocalStorage.
+const originalServerEmit = http.Server.prototype.emit;
 
-http.createServer = ((optionsOrListener?: unknown, maybeListener?: unknown) => {
-  const hasOptions = typeof optionsOrListener !== "function";
-  const listener = (hasOptions ? maybeListener : optionsOrListener) as
-    | ((request: http.IncomingMessage, response: http.ServerResponse) => void)
-    | undefined;
-
-  const wrappedListener = listener
-    ? (request: http.IncomingMessage, response: http.ServerResponse) => {
-        const controller = new AbortController();
-        bindDownstreamAbort(request, response, controller, (reason) => {
-          console.info(JSON.stringify({
-            event: "downstream_disconnect",
-            reason,
-            method: request.method || "",
-            path: request.url || ""
-          }));
-        });
-        runWithDownstreamSignal(controller.signal, () => listener(request, response));
-      }
-    : undefined;
-
-  if (hasOptions) {
-    return originalCreateServer(optionsOrListener as http.ServerOptions, wrappedListener);
+http.Server.prototype.emit = function patchedServerEmit(
+  event: string | symbol,
+  ...args: unknown[]
+): boolean {
+  if (event !== "request") {
+    return originalServerEmit.call(this, event, ...args);
   }
-  return originalCreateServer(wrappedListener);
-}) as typeof http.createServer;
 
-syncBuiltinESMExports();
+  const request = args[0] as http.IncomingMessage | undefined;
+  const response = args[1] as http.ServerResponse | undefined;
+  if (!request || !response) {
+    return originalServerEmit.call(this, event, ...args);
+  }
+
+  const controller = new AbortController();
+  bindDownstreamAbort(request, response, controller, (reason) => {
+    console.info(JSON.stringify({
+      event: "downstream_disconnect",
+      reason,
+      method: request.method || "",
+      path: request.url || ""
+    }));
+  });
+
+  return runWithDownstreamSignal(controller.signal, () =>
+    originalServerEmit.call(this, event, ...args)
+  );
+};
 
 await import("./server");
