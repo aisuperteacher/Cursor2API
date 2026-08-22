@@ -3,11 +3,48 @@ import { hydrateIcons, wireCopyButtons } from "./ui";
 
 const isChatRoute = (): boolean => window.location.pathname.replace(/\/+$/, "") === "/chat";
 const isDashboardRoute = (): boolean => window.location.pathname.replace(/\/+$/, "") === "/dashboard";
+const dashboardHashes = new Set(["#overview", "#connection", "#credentials", "#usage", "#request-logs", "#client-keys"]);
+let dashboardNavObserver: MutationObserver | null = null;
+
+function syncDashboardNav(): void {
+  if (!isDashboardRoute()) return;
+  const activeHash = dashboardHashes.has(window.location.hash) ? window.location.hash : "#overview";
+  document.querySelectorAll<HTMLAnchorElement>(".console-nav a[href^='#']").forEach((anchor) => {
+    const active = anchor.getAttribute("href") === activeHash;
+    anchor.classList.toggle("is-active", active);
+    if (active) anchor.setAttribute("aria-current", "page");
+    else anchor.removeAttribute("aria-current");
+  });
+}
+
+function watchDashboardNav(root: HTMLElement): void {
+  dashboardNavObserver?.disconnect();
+  dashboardNavObserver = null;
+  if (root.querySelector(".console-nav")) {
+    syncDashboardNav();
+    return;
+  }
+  dashboardNavObserver = new MutationObserver(() => {
+    if (!isDashboardRoute()) {
+      dashboardNavObserver?.disconnect();
+      dashboardNavObserver = null;
+      return;
+    }
+    if (!root.querySelector(".console-nav")) return;
+    syncDashboardNav();
+    dashboardNavObserver?.disconnect();
+    dashboardNavObserver = null;
+  });
+  dashboardNavObserver.observe(root, { childList: true, subtree: true });
+}
 
 async function route(): Promise<void> {
   const landing = document.getElementById("landing");
   const chatRoot = document.getElementById("chat-root");
   if (!landing || !chatRoot) return;
+
+  dashboardNavObserver?.disconnect();
+  dashboardNavObserver = null;
 
   if (isDashboardRoute()) {
     landing.hidden = true;
@@ -15,6 +52,7 @@ async function route(): Promise<void> {
     document.title = "Dashboard - API for Cursor";
     const { mountDashboard } = await import("./dashboard");
     mountDashboard(chatRoot);
+    watchDashboardNav(chatRoot);
     return;
   }
 
@@ -47,6 +85,7 @@ document.addEventListener("click", (event) => {
   }
 });
 
+window.addEventListener("hashchange", syncDashboardNav);
 window.addEventListener("popstate", () => void route());
 
 let landingReady = false;
