@@ -70,15 +70,16 @@
 }
 
 /* Sidebar selection is controlled explicitly from location.hash in main.ts. */
-.console-shell .console-nav a {
-  background: transparent;
-  color: #aeb7c5;
+.console-shell .console-nav a,
+.console-shell .console-nav a:first-child {
+  background: transparent !important;
+  color: #aeb7c5 !important;
 }
 
 .console-shell .console-nav a.is-active,
 .console-shell .console-nav a[aria-current="page"] {
-  background: rgba(99, 102, 241, 0.18);
-  color: #fff;
+  background: rgba(99, 102, 241, 0.18) !important;
+  color: #fff !important;
 }
 
 .usage-card {
