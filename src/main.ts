@@ -1,3 +1,4 @@
+import "./dashboard-polish.css";
 import { hydrateIcons, wireCopyButtons } from "./ui";
 
 const isChatRoute = (): boolean => window.location.pathname.replace(/\/+$/, "") === "/chat";
@@ -13,7 +14,6 @@ async function route(): Promise<void> {
     chatRoot.hidden = false;
     document.title = "Dashboard - API for Cursor";
     const { mountDashboard } = await import("./dashboard");
-    await import("./dashboard-polish.css");
     mountDashboard(chatRoot);
     return;
   }
