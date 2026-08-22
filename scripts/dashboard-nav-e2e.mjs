@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,14 +17,23 @@ let chromeProcess;
 let cdp;
 
 function executable(name) {
-  const result = spawnSync("which", [name], { encoding: "utf8" });
-  return result.status === 0 ? result.stdout.trim() : "";
+  const command = process.platform === "win32" ? "where" : "which";
+  const result = spawnSync(command, [name], { encoding: "utf8" });
+  return result.status === 0 ? result.stdout.trim().split(/\r?\n/)[0] : "";
 }
 
 function findChrome() {
   const configured = process.env.CHROME_BIN?.trim();
   if (configured) return configured;
-  for (const candidate of ["google-chrome-stable", "google-chrome", "chromium", "chromium-browser"]) {
+  const windowsCandidates = [
+    join(process.env.ProgramFiles || "C:\\Program Files", "Google", "Chrome", "Application", "chrome.exe"),
+    join(process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)", "Google", "Chrome", "Application", "chrome.exe"),
+    join(process.env.LocalAppData || "", "Google", "Chrome", "Application", "chrome.exe")
+  ];
+  for (const candidate of windowsCandidates) {
+    if (candidate && existsSync(candidate)) return candidate;
+  }
+  for (const candidate of ["google-chrome-stable", "google-chrome", "chromium", "chromium-browser", "chrome"]) {
     const found = executable(candidate);
     if (found) return found;
   }
@@ -273,6 +282,61 @@ async function main() {
     });
     assertNavSnapshot(await navSnapshot(), hash);
   }
+
+  // Regression: logging out and back in re-mounts the console, creating a brand
+  // new .console-nav element. The active state must be re-synced to the current
+  // hash instead of silently falling back to 概览.
+  await cdp.evaluate(`document.querySelector('.console-nav a[href="#client-keys"]').click()`);
+  await waitFor("#client-keys to become the only active sidebar item", async () => {
+    try {
+      assertNavSnapshot(await navSnapshot(), "#client-keys");
+      return true;
+    } catch {
+      return false;
+    }
+  });
+  await cdp.evaluate(`document.querySelector('#logout')?.click()`);
+  await waitFor("the sign-in form after logout", () => cdp.evaluate(
+    `document.querySelector('#auth-password') instanceof HTMLInputElement`
+  ));
+  await cdp.evaluate(`(() => {
+    const input = document.querySelector('#auth-password');
+    input.value = ${JSON.stringify(password)};
+    document.querySelector('#auth-form')?.requestSubmit();
+  })()`);
+  await waitFor("the re-mounted sidebar to keep #client-keys active without any click", async () => {
+    const snapshot = await navSnapshot();
+    if (!snapshot.links.length) return false;
+    try {
+      assertNavSnapshot(snapshot, "#client-keys");
+      return true;
+    } catch {
+      return false;
+    }
+  });
+
+  // Regression: an initial load that already carries a section hash must land on that
+  // section (scroll position), not stay pinned to the top of the page.
+  await cdp.send("Page.navigate", { url: `${baseUrl}/dashboard#request-logs` });
+  await waitFor("the sidebar to mark #request-logs active on initial load", async () => {
+    const snapshot = await navSnapshot();
+    if (!snapshot.links.length) return false;
+    try {
+      assertNavSnapshot(snapshot, "#request-logs");
+      return true;
+    } catch {
+      return false;
+    }
+  });
+  // Panels above the target keep growing while dashboard data loads; the scroll is
+  // re-applied until the layout settles, so poll instead of asserting immediately.
+  const sectionTop = await waitFor("#request-logs to be scrolled into view on initial load", async () => {
+    const top = await cdp.evaluate(
+      `document.querySelector('#request-logs')?.getBoundingClientRect().top ?? Number.NaN`
+    );
+    return Number.isFinite(top) && Math.abs(top) <= 120 ? top : false;
+  }, 8_000);
+  if (sectionTop === false) throw new Error("Expected #request-logs to be scrolled into view on initial load");
 
   console.log("Dashboard sidebar navigation E2E: PASS");
 }
