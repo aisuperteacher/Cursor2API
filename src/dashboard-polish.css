@@ -1,0 +1,112 @@
+/* Final visual polish for the control console. */
+.console-shell .dashboard-main {
+  padding-top: 26px;
+}
+
+.console-hero {
+  align-items: center;
+  padding-top: 4px;
+  padding-bottom: 24px;
+}
+
+.console-hero-copy {
+  align-self: center;
+}
+
+.console-hero h1 {
+  margin-top: 7px;
+}
+
+.dashboard-subtitle {
+  margin-top: 2px;
+}
+
+.dashboard-notice {
+  position: fixed;
+  top: 82px;
+  right: 28px;
+  z-index: 50;
+  width: min(420px, calc(100vw - 40px));
+  margin: 0;
+  padding: 11px 14px;
+  box-shadow: 0 16px 40px rgba(16, 24, 40, 0.14);
+}
+
+.console-grid-primary {
+  align-items: stretch;
+}
+
+.console-grid-primary > .console-card {
+  height: 100%;
+}
+
+.connection-section,
+.usage-section {
+  min-height: 100%;
+}
+
+.connection-grid {
+  margin-top: 2px;
+}
+
+.connection-footnote {
+  margin-top: 18px;
+}
+
+.section-bar {
+  margin-bottom: 20px;
+}
+
+.dashboard-section.console-card {
+  border-radius: 18px;
+}
+
+.console-topbar {
+  min-height: 66px;
+}
+
+.console-breadcrumb {
+  letter-spacing: -0.01em;
+}
+
+.console-nav a:first-child {
+  background: rgba(99, 102, 241, 0.18);
+}
+
+.console-nav a[href="#connection"]:target,
+.console-nav a[href="#credentials"]:target,
+.console-nav a[href="#usage"]:target,
+.console-nav a[href="#request-logs"]:target,
+.console-nav a[href="#client-keys"]:target {
+  color: #fff;
+}
+
+.usage-card {
+  min-height: 102px;
+}
+
+.usage-card strong {
+  margin-top: 1px;
+}
+
+.log-filter-help {
+  padding-top: 1px;
+}
+
+@media (max-width: 1220px) {
+  .dashboard-notice {
+    right: 20px;
+  }
+}
+
+@media (max-width: 720px) {
+  .console-shell .dashboard-main {
+    padding-top: 18px;
+  }
+
+  .dashboard-notice {
+    position: static;
+    width: auto;
+    margin: 0 0 14px;
+  }
+}
