@@ -70,7 +70,7 @@
 }
 
 /* Sidebar selection follows the section targeted by the hash. */
-.console-nav a:first-child {
+.console-shell .console-nav a:first-child {
   background: transparent;
   color: #aeb7c5;
 }
