@@ -195,8 +195,9 @@ bun run tauri dev
 ```powershell
 # from desktop/
 
-# 1. Compile the main API-server sidecar (source lives in ../sidecar/)
-bun build ../sidecar/server.ts --compile `
+# 1. Compile the main API-server sidecar (source lives in ../sidecar/).
+#    server-entry.ts installs the control-console observability runtime first.
+bun build ../sidecar/server-entry.ts --compile `
   --outfile src-tauri/binaries/api-for-cursor-server-x86_64-pc-windows-msvc.exe
 
 # 2. Assemble the @cursor/sdk bridge runtime (a Tauri resource).

@@ -191,7 +191,8 @@ node scripts/cursor-sdk-local-agent-bridge.mjs
 # 终端 2 — Sidecar API
 export PORT=6718
 export CURSOR_SDK_BRIDGE_URL=http://127.0.0.1:6719/sdk
-bun run sidecar/server.ts
+# server-entry.ts 会先安装控制台可观测运行时（/api/usage、/api/request-logs 等）
+bun run sidecar/server-entry.ts
 ```
 
 </details>

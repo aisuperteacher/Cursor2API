@@ -97,7 +97,10 @@ jobs:
           fi
 
       - name: Build sidecar binary
-        run: bun build ../sidecar/server.ts --compile --outfile src-tauri/binaries/api-for-cursor-server-x86_64-pc-windows-msvc.exe
+        # server-entry.ts installs the control-console runtime (observability routes,
+        # request metadata logging) before the API server; building server.ts alone
+        # would leave /api/usage and /api/request-logs on 404 in the desktop app.
+        run: bun build ../sidecar/server-entry.ts --compile --outfile src-tauri/binaries/api-for-cursor-server-x86_64-pc-windows-msvc.exe
 
       - name: Set up SDK bridge runtime (node + @cursor/sdk + script)
         # The @cursor/sdk bridge runs under NODE (not bun): it can't be `bun --compile`d

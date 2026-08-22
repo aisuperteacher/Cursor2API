@@ -69,7 +69,7 @@ All return JSON-serializable values; errors are `Result<T, String>`.
 - Listen on `127.0.0.1:PORT`. Log a single line: `API for Cursor server running at http://127.0.0.1:{port}/v1`.
 - Build target name (Tauri sidecar): base name `api-for-cursor-server`; release bundles
   `desktop/src-tauri/binaries/api-for-cursor-server-x86_64-pc-windows-msvc.exe` via
-  `bun build ../sidecar/server.ts --compile --outfile ...`.
+  `bun build ../sidecar/server-entry.ts --compile --outfile ...` (server-entry installs the control-console observability runtime before importing the API server).
 - It is OK if a request requiring the live Cursor backend fails without a real key; `/v1/models` and `/health` must always work offline.
 
 ## 5. Credentials (Rust, keyring crate — windows-credential-manager does NOT exist)
@@ -213,7 +213,7 @@ Each model object (composer-2.5 shown; fast uses 3.0/15.0 + id/name fast):
 ## 10. Verification bar (what "done" means here)
 - `desktop/src-tauri` → `cargo check` passes (all modules compile).
 - `desktop` frontend → `bun install` + `bun run build` (vite + tsc) passes.
-- `sidecar/` → `bun build server.ts --compile` produces an exe; running it serves `GET /v1/models` and `/health` with NO API key.
+- `sidecar/` → `bun build server-entry.ts --compile` produces an exe; running it serves `GET /v1/models` and `/health` with NO API key.
 - Root worker tests `npm test` still pass UNMODIFIED; `npm run typecheck` passes after the worker route addition.
 - Conventional Commits for any commit: `feat(windows): ...`, `ci(windows): ...`, etc. (do not commit unless asked).
 
