@@ -92,16 +92,59 @@ describe("bounded request logs", () => {
     const directory = mkdtempSync(join(tmpdir(), "cursor2api-logs-"));
     const store = new RequestLogStore({ directory, cleanupIntervalMs: 60_000 });
     await store.append(requestEntry({ id: "one", result: "completed", durationMs: 100 }));
-    await store.append(requestEntry({ id: "two", result: "failed", statusCode: 502, durationMs: 500, model: "claude-4.6-sonnet" }));
+    await store.append(requestEntry({
+      id: "two",
+      result: "failed",
+      statusCode: 502,
+      durationMs: 500,
+      model: "claude-4.6-sonnet",
+      reasoningEffort: "high"
+    }));
     await store.append(requestEntry({ id: "three", result: "canceled", statusCode: 499, credentialId: "cred_2", credentialLabel: "backup" }));
 
-    expect((await store.list({ result: "failed", limit: 10 })).data.map((item) => item.id)).toEqual(["two"]);
+    const failed = await store.list({ result: "failed", limit: 10 });
+    expect(failed.data.map((item) => item.id)).toEqual(["two"]);
+    expect(failed.data[0].reasoningEffort).toBe("high");
     const summary = await store.usageSummary();
     expect(summary.retainedRequests).toBe(3);
     expect(summary.completed).toBe(1);
     expect(summary.failed).toBe(1);
     expect(summary.canceled).toBe(1);
     expect(summary.byCredential.find((item) => item.credentialId === "cred_1")?.requests).toBe(2);
+    store.close();
+  });
+
+  test("paginates newest-first with stable cursors and caps page size", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "cursor2api-pagination-"));
+    const store = new RequestLogStore({ directory, cleanupIntervalMs: 60_000 });
+    const base = Date.UTC(2026, 7, 22, 0, 0, 0);
+    for (let index = 0; index < 60; index += 1) {
+      await store.append(requestEntry({
+        id: `page-${index}`,
+        timestamp: new Date(base + index * 1_000).toISOString(),
+        reasoningEffort: index % 2 === 0 ? "low" : "high"
+      }));
+    }
+
+    const first = await store.list({ limit: 10 });
+    expect(first.data.map((item) => item.id)).toEqual([
+      "page-59", "page-58", "page-57", "page-56", "page-55",
+      "page-54", "page-53", "page-52", "page-51", "page-50"
+    ]);
+    expect(first.hasMore).toBe(true);
+    expect(first.nextCursor).toBeTruthy();
+
+    const second = await store.list({ limit: 10, cursor: first.nextCursor });
+    expect(second.data.map((item) => item.id)).toEqual([
+      "page-49", "page-48", "page-47", "page-46", "page-45",
+      "page-44", "page-43", "page-42", "page-41", "page-40"
+    ]);
+    expect(second.hasMore).toBe(true);
+    expect(second.nextCursor).toBeTruthy();
+
+    const capped = await store.list({ limit: 500 });
+    expect(capped.data).toHaveLength(50);
+    expect(capped.hasMore).toBe(true);
     store.close();
   });
 
