@@ -49,8 +49,11 @@ jobs:
       - name: Run sidecar tests
         run: npm run test:sidecar
 
-      - name: Bundle sidecar entrypoint
-        run: bun build sidecar/server.ts --target=bun --outfile /tmp/cursor2api-sidecar.js
+      - name: Bundle Node sidecar entrypoint
+        run: bun build sidecar/server-entry.ts --target=node --format=esm --outfile /tmp/api-for-cursor.mjs
+
+      - name: Check bundled sidecar syntax
+        run: node --check /tmp/api-for-cursor.mjs
 
       - name: Typecheck
         run: npm run typecheck
