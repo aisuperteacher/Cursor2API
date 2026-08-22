@@ -1,6 +1,6 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { writePrivateJsonAtomic } from "./secure-state";
 
 export interface PoolCatalogModel {
   id: string;
@@ -31,9 +31,15 @@ interface EncryptedValue {
   tag: string;
 }
 
+export class CursorRouterStateError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "CursorRouterStateError";
+  }
+}
+
 export class CursorCredentialPool {
   readonly credentials: PoolCredential[];
-  private readonly rotation = new Map<string, number>();
   private readonly statePath?: string;
   private readonly encryptionKey?: Buffer;
 
@@ -42,12 +48,15 @@ export class CursorCredentialPool {
     this.encryptionKey = encryptionSecret?.trim()
       ? createHash("sha256").update(encryptionSecret.trim()).digest()
       : undefined;
+    if (state.credentials.length && !this.encryptionKey) {
+      throw new CursorRouterStateError("ENCRYPTION_KEY is required to load managed Cursor credentials");
+    }
     const storedKeys = this.encryptionKey
-      ? state.credentials.flatMap((item) => {
+      ? state.credentials.map((item) => {
           try {
-            return [{ apiKey: decryptValue(item.secret, this.encryptionKey!), label: item.label, managed: true }];
-          } catch {
-            return [];
+            return { apiKey: decryptValue(item.secret, this.encryptionKey!), label: item.label, managed: true };
+          } catch (error) {
+            throw new CursorRouterStateError(`Could not decrypt managed Cursor credential ${item.id}`, { cause: error });
           }
         })
       : [];
@@ -113,8 +122,7 @@ export class CursorCredentialPool {
     if (eligible.length <= 1) return eligible;
 
     const key = `${modelId}:${affinity}`;
-    const start = this.rotation.get(key) ?? stableIndex(key, eligible.length);
-    this.rotation.set(key, (start + 1) % eligible.length);
+    const start = stableIndex(key, eligible.length);
     return [...eligible.slice(start), ...eligible.slice(0, start)];
   }
 
@@ -182,10 +190,9 @@ export class CursorCredentialPool {
         : [],
     };
     try {
-      mkdirSync(dirname(this.statePath), { recursive: true });
-      writeFileSync(this.statePath, JSON.stringify(state, null, 2), "utf8");
+      writePrivateJsonAtomic(this.statePath, state);
     } catch (error) {
-      console.warn(`Could not persist Cursor router state: ${error instanceof Error ? error.message : String(error)}`);
+      throw new CursorRouterStateError(`Could not persist Cursor router state at ${this.statePath}`, { cause: error });
     }
   }
 }
@@ -257,18 +264,53 @@ function credentialId(apiKey: string): string {
 
 function readRouterState(statePath?: string): RouterState {
   const empty = (): RouterState => ({ version: 2, disabledModels: {}, disabledCredentials: {}, credentials: [] });
-  if (!statePath) return empty();
+  if (!statePath || !existsSync(statePath)) return empty();
+
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(readFileSync(statePath, "utf8")) as Partial<RouterState>;
-    return {
-      version: 2,
-      disabledModels: parsed.disabledModels && typeof parsed.disabledModels === "object" ? parsed.disabledModels : {},
-      disabledCredentials: parsed.disabledCredentials && typeof parsed.disabledCredentials === "object" ? parsed.disabledCredentials : {},
-      credentials: Array.isArray(parsed.credentials) ? parsed.credentials : []
-    };
-  } catch {
-    return empty();
+    parsed = JSON.parse(readFileSync(statePath, "utf8"));
+  } catch (error) {
+    throw new CursorRouterStateError(`Cursor router state at ${statePath} is not valid JSON`, { cause: error });
   }
+  if (!isPlainRecord(parsed) || parsed.version !== 2) {
+    throw new CursorRouterStateError(`Cursor router state at ${statePath} has an unsupported or missing version`);
+  }
+  if (!isStringArrayRecord(parsed.disabledModels)) {
+    throw new CursorRouterStateError(`Cursor router state at ${statePath} has invalid disabledModels`);
+  }
+  if (!isStringRecord(parsed.disabledCredentials)) {
+    throw new CursorRouterStateError(`Cursor router state at ${statePath} has invalid disabledCredentials`);
+  }
+  if (!Array.isArray(parsed.credentials) || !parsed.credentials.every(isStoredCredential)) {
+    throw new CursorRouterStateError(`Cursor router state at ${statePath} has invalid credentials`);
+  }
+  return {
+    version: 2,
+    disabledModels: parsed.disabledModels,
+    disabledCredentials: parsed.disabledCredentials,
+    credentials: parsed.credentials
+  };
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isStringArrayRecord(value: unknown): value is Record<string, string[]> {
+  return isPlainRecord(value) && Object.values(value).every(
+    (entry) => Array.isArray(entry) && entry.every((item) => typeof item === "string")
+  );
+}
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+  return isPlainRecord(value) && Object.values(value).every((entry) => typeof entry === "string");
+}
+
+function isStoredCredential(value: unknown): value is RouterState["credentials"][number] {
+  if (!isPlainRecord(value) || typeof value.id !== "string" || typeof value.label !== "string" || !isPlainRecord(value.secret)) {
+    return false;
+  }
+  return [value.secret.ciphertext, value.secret.iv, value.secret.tag].every((field) => typeof field === "string");
 }
 
 function encryptValue(value: string, key: Buffer): EncryptedValue {

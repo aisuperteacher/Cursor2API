@@ -8,6 +8,7 @@ export interface PreparedRequest {
   model: string;
   cursorModel?: { id: string };
   prompt: CursorPrompt;
+  incrementalPrompt?: CursorPrompt;
   stream: boolean;
   includeUsage: boolean;
   promptChars: number;
@@ -155,10 +156,16 @@ export function prepareChatRequest(body: unknown, cursorModel: { id: string } | 
   }
   appendChatOptions(transcript, record);
   const text = transcript.join("\n");
+  const incrementalPrompt = buildChatIncrementalPrompt(
+    messages,
+    agentMode ? "agent" : "ask",
+    workspaceMutationIntent
+  );
   return {
     model,
     cursorModel,
     prompt: { text, mode: agentMode ? "agent" : "ask", ...(images.length ? { images } : {}) },
+    incrementalPrompt,
     stream: record.stream === true,
     includeUsage: includeStreamUsage(record),
     promptChars: text.length,
@@ -171,6 +178,53 @@ export function prepareChatRequest(body: unknown, cursorModel: { id: string } | 
     storeResponse: false,
     toolContext
   };
+}
+
+function buildChatIncrementalPrompt(
+  messages: unknown[],
+  mode: "ask" | "agent",
+  workspaceMutationIntent: boolean
+): CursorPrompt | undefined {
+  let lastAssistant = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message && typeof message === "object" && !Array.isArray(message) && (message as Record<string, unknown>).role === "assistant") {
+      lastAssistant = index;
+      break;
+    }
+  }
+  if (lastAssistant < 0 || lastAssistant >= messages.length - 1) return undefined;
+
+  const transcript = [
+    "Continue the existing conversation using only the new turn below.",
+    "Prior conversation context and client tool schemas are already attached to the cached Agent.",
+    "",
+    "NEW TURN:"
+  ];
+  const images: CursorImage[] = [];
+  for (const message of messages.slice(lastAssistant + 1)) {
+    const item = expectRecord(message, "messages[]");
+    const role = typeof item.role === "string" ? item.role : "user";
+    const { text, images: messageImages } = contentToTextAndImages(item.content, role);
+    images.push(...messageImages);
+    if (role === "tool") {
+      const toolCallId = typeof item.tool_call_id === "string" ? item.tool_call_id : "";
+      const toolName = typeof item.name === "string" ? item.name : "";
+      const label = [toolName ? `name=${toolName}` : "", toolCallId ? `tool_call_id=${toolCallId}` : ""]
+        .filter(Boolean)
+        .join(" ");
+      transcript.push(`TOOL RESULT${label ? ` (${label})` : ""}: ${text || "[empty]"}`);
+    } else {
+      const content = workspaceMutationIntent && role === "user" ? addWorkspaceActionToUserText(text) : text;
+      transcript.push(`${role.toUpperCase()}: ${content || "[empty]"}`);
+    }
+    if (Array.isArray(item.tool_calls)) {
+      transcript.push(`${role.toUpperCase()} TOOL_CALLS: ${JSON.stringify(item.tool_calls)}`);
+    }
+  }
+
+  const text = transcript.join("\n");
+  return { text, mode, ...(images.length ? { images } : {}) };
 }
 
 export function prepareOpencodeSdkChatRequest(body: unknown, cursorModel: { id: string } | undefined): PreparedRequest {
@@ -546,6 +600,48 @@ export function responseErrorEvent(message: string, sequenceNumber = 0): Uint8Ar
       }
     },
     "error"
+  );
+}
+
+export function responseFailedEvent(input: {
+  id: string;
+  created: number;
+  model: string;
+  message: string;
+  metadata?: Record<string, unknown>;
+  sequenceNumber?: number;
+}): Uint8Array {
+  const response = {
+    id: input.id,
+    object: "response",
+    created_at: input.created,
+    incomplete_details: null,
+    model: input.model,
+    output: [],
+    parallel_tool_calls: true,
+    previous_response_id: null,
+    reasoning: { effort: null, summary: null },
+    store: false,
+    tool_choice: "auto",
+    tools: [],
+    truncation: "disabled",
+    usage: null,
+    user: null,
+    metadata: {},
+    ...input.metadata,
+    status: "failed",
+    error: {
+      code: "cursor_stream_error",
+      message: input.message
+    }
+  };
+  return encodeSse(
+    {
+      type: "response.failed",
+      sequence_number: input.sequenceNumber ?? 0,
+      response
+    },
+    "response.failed"
   );
 }
 

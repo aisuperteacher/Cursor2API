@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { spawn, spawnSync } from "node:child_process";
 import http from "node:http";
 import { fileURLToPath } from "node:url";
@@ -7,9 +7,13 @@ import {
   clientForwardingMcpServerSource,
   clientMcpToolDefinitions,
   composerToolCallFromText,
+  createRunAbortController,
+  createRunTimeoutController,
   localAgentCreateOptions,
   localAgentSendOptions,
   isAuthenticationSDKError,
+  bridgeRequiresToken,
+  isLoopbackHost,
   isForwardableSDKToolCall,
   isRetryableSDKRunError,
   normalizeModel,
@@ -2001,4 +2005,110 @@ describe("Cursor SDK local-agent bridge", () => {
     expect(baseSendOptions).not.toHaveProperty("mcpServers");
     expect(dynamicSendOptions).not.toHaveProperty("mcpServers");
   });
+});
+
+
+describe("Cursor SDK bridge deadlines", () => {
+  it("refreshes the idle deadline on progress", async () => {
+    vi.useFakeTimers();
+    try {
+      let failure;
+      const timeout = createRunTimeoutController({ requestId: "idle-test", idleTimeoutMs: 100, hardTimeoutMs: 500 });
+      timeout.promise.catch((error) => { failure = error; });
+      await vi.advanceTimersByTimeAsync(80);
+      expect(failure).toBeUndefined();
+      timeout.progress("delta:assistant");
+      await vi.advanceTimersByTimeAsync(80);
+      expect(failure).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(21);
+      expect(failure?.timeoutType).toBe("idle");
+      expect(failure?.lastProgressKind).toBe("delta:assistant");
+      timeout.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not refresh the hard deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      let failure;
+      const timeout = createRunTimeoutController({ requestId: "hard-test", idleTimeoutMs: 1_000, hardTimeoutMs: 250 });
+      timeout.promise.catch((error) => { failure = error; });
+      await vi.advanceTimersByTimeAsync(100);
+      timeout.progress("delta:first");
+      await vi.advanceTimersByTimeAsync(100);
+      timeout.progress("delta:second");
+      await vi.advanceTimersByTimeAsync(51);
+      expect(failure?.timeoutType).toBe("hard");
+      expect(failure?.elapsedMs).toBeGreaterThanOrEqual(250);
+      timeout.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("rejects an aborted bridge run and invokes its cancellation callback", async () => {
+    const controller = new AbortController();
+    let cancellations = 0;
+    const abort = createRunAbortController(controller.signal, () => {
+      cancellations += 1;
+    });
+
+    controller.abort(new Error("client disconnected"));
+    await expect(abort.promise).rejects.toMatchObject({ name: "AbortError", code: "ABORT_ERR" });
+    expect(cancellations).toBe(1);
+    abort.stop();
+  });
+
+  it("removes an aborted queued run without starting work for that client", async () => {
+    const input = {
+      apiKey: "test-key",
+      model: "default",
+      workingDirectory: "/tmp/project",
+      sessionKey: "abort-queue-session",
+      clientTools: []
+    };
+    let releaseFirst;
+    let firstStarted;
+    const started = new Promise((resolve) => { firstStarted = resolve; });
+    const first = runExclusiveForAgent(input, async () => {
+      firstStarted();
+      await new Promise((resolve) => { releaseFirst = resolve; });
+      return "first";
+    });
+    await started;
+
+    const controller = new AbortController();
+    let secondStarted = false;
+    const second = runExclusiveForAgent({ ...input, signal: controller.signal }, async () => {
+      secondStarted = true;
+      return "second";
+    });
+    controller.abort(new Error("client disconnected"));
+
+    await expect(second).rejects.toMatchObject({ name: "AbortError", code: "ABORT_ERR" });
+    expect(secondStarted).toBe(false);
+    releaseFirst();
+    await expect(first).resolves.toBe("first");
+  });
+
+
+  it("only permits tokenless bridge binding on loopback interfaces", () => {
+    expect(isLoopbackHost("127.0.0.1")).toBe(true);
+    expect(isLoopbackHost("127.0.0.42")).toBe(true);
+    expect(isLoopbackHost("localhost")).toBe(true);
+    expect(isLoopbackHost("::1")).toBe(true);
+    expect(isLoopbackHost("0.0.0.0")).toBe(false);
+    expect(isLoopbackHost("192.168.1.10")).toBe(false);
+    expect(isLoopbackHost("::")).toBe(false);
+  });
+
+  it("requires a bridge token for non-loopback binding", () => {
+    expect(bridgeRequiresToken("0.0.0.0", "")).toBe(true);
+    expect(bridgeRequiresToken("::", "")).toBe(true);
+    expect(bridgeRequiresToken("0.0.0.0", "bridge-secret")).toBe(false);
+    expect(bridgeRequiresToken("127.0.0.1", "")).toBe(false);
+  });
+
 });

@@ -1,6 +1,6 @@
-import { createHash, createHmac, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import { writePrivateJsonAtomic } from "./secure-state";
 
 interface ClientKeyRecord {
   id: string;
@@ -25,15 +25,22 @@ export interface ClientKeyInfo {
   createdAt: string;
 }
 
+export class LocalAuthStateError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "LocalAuthStateError";
+  }
+}
+
 export class LocalAuthStore {
   private readonly statePath: string;
-  private readonly configuredClientKey: string;
+  private readonly configuredClientKeyHash: string;
   private state: AuthState;
   private readonly sessions = new Map<string, number>();
 
   constructor(statePath: string, configuredAdminPassword = "", configuredClientKey = "") {
     this.statePath = statePath;
-    this.configuredClientKey = configuredClientKey.trim();
+    this.configuredClientKeyHash = configuredClientKey.trim() ? hashToken(configuredClientKey.trim()) : "";
     this.state = readState(statePath);
     if (configuredAdminPassword.trim() && !this.state.adminPasswordHash) {
       this.state.adminPasswordHash = hashPassword(configuredAdminPassword.trim());
@@ -79,9 +86,9 @@ export class LocalAuthStore {
   clientKey(token: string): boolean {
     const candidate = token.trim();
     if (!candidate) return false;
-    if (this.configuredClientKey && candidate === this.configuredClientKey) return true;
     const digest = hashToken(candidate);
-    return this.state.clientKeys.some((item) => item.hash === digest);
+    if (this.configuredClientKeyHash && safeHexEqual(digest, this.configuredClientKeyHash)) return true;
+    return this.state.clientKeys.some((item) => safeHexEqual(item.hash, digest));
   }
 
   listClientKeys(): ClientKeyInfo[] {
@@ -122,16 +129,15 @@ export class LocalAuthStore {
 
   private persist(): void {
     try {
-      mkdirSync(dirname(this.statePath), { recursive: true });
-      writeFileSync(this.statePath, JSON.stringify(this.state, null, 2), { encoding: "utf8", mode: 0o600 });
+      writePrivateJsonAtomic(this.statePath, this.state);
     } catch (error) {
-      console.warn(`Could not persist local auth state: ${error instanceof Error ? error.message : String(error)}`);
+      throw new LocalAuthStateError(`Could not persist local auth state at ${this.statePath}`, { cause: error });
     }
   }
 }
 
-export function sessionCookie(token: string, maxAge = 60 * 60 * 24 * 7): string {
-  return `cursor2api_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}`;
+export function sessionCookie(token: string, maxAge = 60 * 60 * 24 * 7, secure = false): string {
+  return `cursor2api_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${secure ? "; Secure" : ""}`;
 }
 
 export function sessionToken(request: Request): string {
@@ -143,18 +149,51 @@ export function sessionToken(request: Request): string {
 function readState(path: string): AuthState {
   const fallback: AuthState = { version: 1, sessionSecret: randomBytes(32).toString("hex"), clientKeys: [] };
   if (!existsSync(path)) return fallback;
+
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<AuthState>;
-    return {
-      version: 1,
-      adminPasswordHash: typeof parsed.adminPasswordHash === "string" ? parsed.adminPasswordHash : undefined,
-      sessionSecret: typeof parsed.sessionSecret === "string" ? parsed.sessionSecret : fallback.sessionSecret,
-      clientKeys: Array.isArray(parsed.clientKeys) ? parsed.clientKeys.filter((item): item is ClientKeyRecord => Boolean(item && typeof item.id === "string" && typeof item.hash === "string")) : [],
-      publicBaseUrl: typeof parsed.publicBaseUrl === "string" ? parsed.publicBaseUrl : undefined
-    };
-  } catch {
-    return fallback;
+    parsed = JSON.parse(readFileSync(path, "utf8"));
+  } catch (error) {
+    throw new LocalAuthStateError(`Local auth state at ${path} is not valid JSON`, { cause: error });
   }
+  if (!isRecord(parsed) || parsed.version !== 1) {
+    throw new LocalAuthStateError(`Local auth state at ${path} has an unsupported or missing version`);
+  }
+  if (typeof parsed.sessionSecret !== "string" || !parsed.sessionSecret) {
+    throw new LocalAuthStateError(`Local auth state at ${path} is missing sessionSecret`);
+  }
+  if (parsed.adminPasswordHash !== undefined && typeof parsed.adminPasswordHash !== "string") {
+    throw new LocalAuthStateError(`Local auth state at ${path} has an invalid adminPasswordHash`);
+  }
+  if (!Array.isArray(parsed.clientKeys)) {
+    throw new LocalAuthStateError(`Local auth state at ${path} has an invalid clientKeys collection`);
+  }
+  const clientKeys = parsed.clientKeys.map((item, index) => parseClientKey(item, path, index));
+  if (parsed.publicBaseUrl !== undefined && typeof parsed.publicBaseUrl !== "string") {
+    throw new LocalAuthStateError(`Local auth state at ${path} has an invalid publicBaseUrl`);
+  }
+
+  return {
+    version: 1,
+    adminPasswordHash: parsed.adminPasswordHash as string | undefined,
+    sessionSecret: parsed.sessionSecret,
+    clientKeys,
+    publicBaseUrl: parsed.publicBaseUrl as string | undefined
+  };
+}
+
+function parseClientKey(value: unknown, path: string, index: number): ClientKeyRecord {
+  if (!isRecord(value)) throw new LocalAuthStateError(`Local auth state at ${path} has an invalid clientKeys[${index}]`);
+  for (const field of ["id", "label", "hint", "hash", "createdAt"] as const) {
+    if (typeof value[field] !== "string") {
+      throw new LocalAuthStateError(`Local auth state at ${path} has an invalid clientKeys[${index}].${field}`);
+    }
+  }
+  return value as unknown as ClientKeyRecord;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function validPassword(password: string): boolean {
@@ -177,4 +216,11 @@ function verifyPassword(password: string, encoded: string): boolean {
 
 function hashToken(token: string): string {
   return createHash("sha256").update(token).digest("hex");
+}
+
+function safeHexEqual(left: string, right: string): boolean {
+  if (!/^[0-9a-f]+$/i.test(left) || !/^[0-9a-f]+$/i.test(right)) return false;
+  const leftBuffer = Buffer.from(left, "hex");
+  const rightBuffer = Buffer.from(right, "hex");
+  return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
 }

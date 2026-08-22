@@ -20,7 +20,7 @@
  * only need thin adapters between `node:http` messages and Web types.
  */
 
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, type IncomingMessage } from "node:http";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { extname, resolve, sep } from "node:path";
 
@@ -42,6 +42,7 @@ import {
   responseDeltaEvent,
   responseDoneEvents,
   responseErrorEvent,
+  responseFailedEvent,
   responseObject,
   responseTextStartEvents,
   responseToolCallEvents,
@@ -72,14 +73,22 @@ import {
   canonicalModelId,
   CursorCredentialPool,
   isBillingError,
-  parseCursorCredentialEnv
+  parseCursorCredentialEnv,
+  type PoolCredential
 } from "./router";
+import { AsyncStaleCache } from "./async-stale-cache";
+import { AnthropicSessionLinkStore, preferCredential, type AnthropicContinuation } from "./anthropic-session";
 import { LocalAuthStore, sessionCookie, sessionToken } from "./auth";
+import { LoginAttemptLimiter } from "./login-limiter";
+import { bindDownstreamAbort, runWithDownstreamSignal } from "./downstream-abort";
+import { writeWebResponse } from "./node-response";
+import { streamOpenAiEvents, streamOpenAiResponse } from "../worker/openai-stream";
 
 const HOST = process.env.HOST?.trim() || "127.0.0.1";
 const DEFAULT_PORT = 8787;
 const PRIMARY_MODEL = "auto";
 const STATIC_DIR = process.env.STATIC_DIR?.trim() ? resolve(process.env.STATIC_DIR.trim()) : "";
+const MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024;
 
 /**
  * Minimal `Deps` backed by the real runtime. Identical in spirit to the
@@ -113,7 +122,7 @@ function buildEnv(): Env {
     CURSOR_CLIENT_VERSION: process.env.CURSOR_CLIENT_VERSION || "2.6.22",
     CURSOR_SDK_BRIDGE_URL: process.env.CURSOR_SDK_BRIDGE_URL,
     CURSOR_SDK_BRIDGE_TOKEN: process.env.CURSOR_SDK_BRIDGE_TOKEN,
-    CURSOR_SDK_BRIDGE_TIMEOUT_MS: process.env.CURSOR_SDK_BRIDGE_RUN_TIMEOUT_MS
+    CURSOR_SDK_BRIDGE_TIMEOUT_MS: process.env.CURSOR_SDK_BRIDGE_IDLE_TIMEOUT_MS || process.env.CURSOR_SDK_BRIDGE_RUN_TIMEOUT_MS
   };
 }
 
@@ -126,6 +135,12 @@ const credentialPool = new CursorCredentialPool(
 const authStatePath = process.env.LOCAL_AUTH_STATE_PATH?.trim()
   || (process.env.CURSOR_ROUTER_STATE_PATH?.trim() || ".cursor2api/router-state.json") + ".auth";
 const authStore = new LocalAuthStore(authStatePath, process.env.ADMIN_PASSWORD || "");
+const loginLimiter = new LoginAttemptLimiter(
+  Number.parseInt(process.env.ADMIN_LOGIN_MAX_FAILURES || "5", 10) || 5,
+  Number.parseInt(process.env.ADMIN_LOGIN_WINDOW_MS || "900000", 10) || 900_000,
+  Number.parseInt(process.env.ADMIN_LOGIN_LOCKOUT_MS || "900000", 10) || 900_000
+);
+const anthropicSessionLinks = new AnthropicSessionLinkStore();
 
 /**
  * The SDK bridge path (full macOS parity) is the PRIMARY route for
@@ -349,7 +364,7 @@ interface CursorCatalogModel {
 }
 
 const MODEL_CATALOG_TTL_MS = 60_000;
-const modelCatalogCache = new Map<string, { models: CursorCatalogModel[]; expiresAt: number }>();
+const modelCatalogCache = new AsyncStaleCache<CursorCatalogModel[]>(MODEL_CATALOG_TTL_MS);
 
 async function modelCatalogCacheKey(apiKey: string): Promise<string> {
   const bytes = new TextEncoder().encode(apiKey);
@@ -370,37 +385,35 @@ function cursorSdkModelsUrl(): string {
 
 async function liveCursorModels(apiKey: string): Promise<CursorCatalogModel[]> {
   const cacheKey = await modelCatalogCacheKey(apiKey);
-  const cached = modelCatalogCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) return cached.models;
+  return modelCatalogCache.get(cacheKey, async () => {
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    const bridgeToken = env.CURSOR_SDK_BRIDGE_TOKEN?.trim();
+    if (bridgeToken) headers.authorization = `Bearer ${bridgeToken}`;
 
-  const headers: Record<string, string> = { "content-type": "application/json" };
-  const bridgeToken = env.CURSOR_SDK_BRIDGE_TOKEN?.trim();
-  if (bridgeToken) headers.authorization = `Bearer ${bridgeToken}`;
-
-  const response = await deps.fetch(cursorSdkModelsUrl(), {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ apiKey })
-  });
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    let message = text || `Cursor model discovery failed with status ${response.status}`;
-    try {
-      const payload = JSON.parse(text) as { error?: { message?: string } };
-      if (payload.error?.message) message = payload.error.message;
-    } catch {
-      // Keep the raw response text.
+    const response = await deps.fetch(cursorSdkModelsUrl(), {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ apiKey })
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      let message = text || `Cursor model discovery failed with status ${response.status}`;
+      try {
+        const payload = JSON.parse(text) as { error?: { message?: string } };
+        if (payload.error?.message) message = payload.error.message;
+      } catch {
+        // Keep the raw response text.
+      }
+      const authenticationFailure = response.status === 401 || response.status === 403;
+      const status = authenticationFailure ? response.status : response.status === 429 ? 429 : 502;
+      throw new HttpError(message, status, authenticationFailure ? "cursor_unauthorized" : "cursor_models_error");
     }
-    const status = response.status === 401 ? 401 : response.status === 429 ? 429 : 502;
-    throw new HttpError(message, status, response.status === 401 ? "cursor_unauthorized" : "cursor_models_error");
-  }
 
-  const payload = await response.json() as { models?: CursorCatalogModel[] };
-  const models = Array.isArray(payload.models)
-    ? payload.models.filter((model) => model && typeof model.id === "string" && typeof model.displayName === "string")
-    : [];
-  modelCatalogCache.set(cacheKey, { models, expiresAt: Date.now() + MODEL_CATALOG_TTL_MS });
-  return models;
+    const payload = await response.json() as { models?: CursorCatalogModel[] };
+    return Array.isArray(payload.models)
+      ? payload.models.filter((model) => model && typeof model.id === "string" && typeof model.displayName === "string")
+      : [];
+  });
 }
 
 function parameterizedModelId(modelId: string, params: Array<{ id: string; value: string }>): string {
@@ -476,6 +489,28 @@ function configuredPublicBaseUrl(): string {
   return authStore.publicBaseUrl() || (process.env.PUBLIC_BASE_URL || "").trim().replace(/\/+$/, "");
 }
 
+function trustProxyHeaders(): boolean {
+  return (process.env.TRUST_PROXY_HEADERS || "").trim().toLowerCase() === "true";
+}
+
+function requestUsesTls(request: Request): boolean {
+  if (new URL(request.url).protocol === "https:") return true;
+  if (configuredPublicBaseUrl().toLowerCase().startsWith("https://")) return true;
+  if (!trustProxyHeaders()) return false;
+  const forwardedProto = (request.headers.get("x-forwarded-proto") || "").split(",")[0].trim().toLowerCase();
+  return forwardedProto === "https";
+}
+
+function loginIdentity(request: Request): string {
+  if (trustProxyHeaders()) {
+    const forwarded = request.headers.get("cf-connecting-ip")
+      || request.headers.get("x-real-ip")
+      || (request.headers.get("x-forwarded-for") || "").split(",")[0];
+    if (forwarded?.trim()) return forwarded.trim();
+  }
+  return request.headers.get("x-cursor2api-remote-address") || "unknown";
+}
+
 function publicApiBaseUrl(request: Request): string {
   const configured = configuredPublicBaseUrl();
   return (configured || new URL(request.url).origin) + "/v1";
@@ -504,21 +539,37 @@ async function handleAuthSetup(request: Request): Promise<Response> {
   const password = typeof body.password === "string" ? body.password : "";
   const token = authStore.setup(password);
   if (!token) throw new HttpError("Password must contain at least 8 characters", 400, "invalid_request_error", "password");
-  return json({ configured: true, authenticated: true }, { headers: { "set-cookie": sessionCookie(token) } });
+  return json({ configured: true, authenticated: true }, {
+    headers: { "set-cookie": sessionCookie(token, undefined, requestUsesTls(request)) }
+  });
 }
 
 async function handleAuthLogin(request: Request): Promise<Response> {
   if (!authStore.isConfigured()) throw new HttpError("Set an administrator password before signing in", 409, "setup_required");
+  const identity = loginIdentity(request);
+  const retryAfter = loginLimiter.retryAfterSeconds(identity);
+  if (retryAfter > 0) {
+    return json(
+      { error: { message: "Too many administrator login attempts", type: "rate_limit_error", code: "rate_limit_exceeded" } },
+      { status: 429, headers: { "retry-after": String(retryAfter) } }
+    );
+  }
   const body = await request.json() as Record<string, unknown>;
   const password = typeof body.password === "string" ? body.password : "";
   const token = authStore.login(password);
-  if (!token) return unauthorized();
-  return json({ configured: true, authenticated: true }, { headers: { "set-cookie": sessionCookie(token) } });
+  if (!token) {
+    loginLimiter.recordFailure(identity);
+    return unauthorized();
+  }
+  loginLimiter.reset(identity);
+  return json({ configured: true, authenticated: true }, {
+    headers: { "set-cookie": sessionCookie(token, undefined, requestUsesTls(request)) }
+  });
 }
 
 function handleAuthLogout(request: Request): Response {
   authStore.revokeSession(sessionToken(request));
-  return json({ ok: true }, { headers: { "set-cookie": sessionCookie("", 0) } });
+  return json({ ok: true }, { headers: { "set-cookie": sessionCookie("", 0, requestUsesTls(request)) } });
 }
 
 async function handleSettings(request: Request): Promise<Response> {
@@ -606,15 +657,17 @@ async function handleLocalCredentials(request: Request, credentialId = ""): Prom
 async function routeCredentialRequest(
   request: Request,
   requestedModel: string,
-  run: (apiKey: string, onBillingError?: (error: unknown) => void) => Promise<Response>
+  run: (apiKey: string, onBillingError: ((error: unknown) => void) | undefined, credential: PoolCredential) => Promise<Response>,
+  preferredCredentialId?: string
 ): Promise<Response> {
   if (!resolveAccess(request)) return unauthorized();
 
-  const candidates = await credentialPool.candidates(
+  let candidates = await credentialPool.candidates(
     requestedModel,
     sessionAffinity(request),
     liveCursorModels
   );
+  candidates = preferCredential(candidates, preferredCredentialId);
   if (!candidates.length) {
     throw new HttpError(`Model '${requestedModel}' is not available for the configured Cursor credential pool`, 404, "model_not_found", "model");
   }
@@ -633,7 +686,7 @@ async function routeCredentialRequest(
       }));
     };
     try {
-      return await run(credential.apiKey, disableOnBilling);
+      return await run(credential.apiKey, disableOnBilling, credential);
     } catch (error) {
       if (!isBillingError(error)) throw error;
       lastBillingError = error;
@@ -667,7 +720,7 @@ async function handleChatCompletionsWithKey(
   const created = Math.floor(deps.now().getTime() / 1000);
 
   if (hasSdkBridge()) {
-    return handleSdkRoute("chat", request, prepared, apiKey, id, created, chatIncrementalPrompt(body, cursorModel), onBillingError);
+    return handleSdkRoute("chat", request, prepared, apiKey, id, created, prepared.incrementalPrompt, onBillingError);
   }
 
   const completion = await createCursorCompletion(env, deps, apiKey, {
@@ -809,7 +862,9 @@ function isTransientSdkError(error: unknown): boolean {
 /**
  * Wrap an SDK event stream so a transient failure *before any event is emitted* retries
  * with a fresh attempt (the factory decides what changes per attempt). Once any event has
- * been yielded we never retry, so partial output is never duplicated.
+ * been yielded we never retry, so partial output is never duplicated. Cancellation of the
+ * outer iterator always closes the active inner iterator so cancellation can continue
+ * toward the bridge reader rather than leaving an orphaned SDK run behind.
  */
 function retryingSdkStream(
   make: (attempt: number) => Promise<AsyncIterable<CursorTextEvent>>,
@@ -820,54 +875,32 @@ function retryingSdkStream(
       for (let attempt = 0; ; attempt += 1) {
         const iterator = (await make(attempt))[Symbol.asyncIterator]();
         let emitted = false;
+        let completed = false;
         try {
           for (;;) {
             const next = await iterator.next();
-            if (next.done) return;
+            if (next.done) {
+              completed = true;
+              return;
+            }
             emitted = true;
             yield next.value;
           }
         } catch (error) {
-          try {
-            await iterator.return?.();
-          } catch {
-            /* ignore */
-          }
           if (!emitted && attempt + 1 < maxAttempts && isTransientSdkError(error)) continue;
           throw error;
+        } finally {
+          if (!completed) {
+            try {
+              await iterator.return?.();
+            } catch {
+              /* cleanup must not replace the original completion/error */
+            }
+          }
         }
       }
     }
   };
-}
-
-/**
- * The incremental "new turn" for a follow-up chat request: every message after the last
- * assistant message. Returned as a CursorPrompt so a still-cached SDK agent receives only
- * the new turn instead of the whole conversation. Undefined on the first turn (no prior
- * assistant) — then the bridge uses the full prompt.
- */
-function chatIncrementalPrompt(
-  body: unknown,
-  cursorModel: { id: string }
-): ReturnType<typeof prepareChatRequest>["prompt"] | undefined {
-  const messages = (body as { messages?: Array<{ role?: string }> } | null)?.messages;
-  if (!Array.isArray(messages) || messages.length === 0) return undefined;
-  let lastAssistant = -1;
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    if (messages[i]?.role === "assistant") {
-      lastAssistant = i;
-      break;
-    }
-  }
-  if (lastAssistant < 0 || lastAssistant >= messages.length - 1) return undefined;
-  const tail = messages.slice(lastAssistant + 1);
-  try {
-    const deltaBody = { ...(body as Record<string, unknown>), messages: tail, stream: false };
-    return prepareChatRequest(deltaBody as Parameters<typeof prepareChatRequest>[0], cursorModel).prompt;
-  } catch {
-    return undefined;
-  }
 }
 
 /** Shared tool-call gate for the SDK paths (OpenAI + Anthropic): allow a tool call only
@@ -917,9 +950,10 @@ async function handleAnthropicMessages(request: Request): Promise<Response> {
     body && typeof body === "object" && typeof (body as { model?: unknown }).model === "string"
       ? (body as { model: string }).model
       : PRIMARY_MODEL;
-  return routeCredentialRequest(request, requestedModel, (apiKey, onBillingError) => (
-    handleAnthropicMessagesWithKey(request, body, requestedModel, apiKey, onBillingError)
-  ));
+  const continuation = anthropicSessionLinks.findFromBody(body);
+  return routeCredentialRequest(request, requestedModel, (apiKey, onBillingError, credential) => (
+    handleAnthropicMessagesWithKey(request, body, requestedModel, apiKey, credential, continuation, onBillingError)
+  ), continuation?.link.credentialId);
 }
 
 async function handleAnthropicMessagesWithKey(
@@ -927,6 +961,8 @@ async function handleAnthropicMessagesWithKey(
   body: unknown,
   requestedModel: string,
   apiKey: string,
+  credential: PoolCredential,
+  continuation?: AnthropicContinuation,
   onBillingError?: (error: unknown) => void
 ): Promise<Response> {
   const translatedBody = anthropicToChatBody(body);
@@ -938,14 +974,32 @@ async function handleAnthropicMessagesWithKey(
   const id = `msg_${crypto.randomUUID().replaceAll("-", "")}`;
   const inputTokens = estimateTokens(prepared.promptChars);
 
-  // Claude Code resends the full conversation (incl. tool_result) every turn, so /v1/messages is
-  // stateless: a fresh SDK session + full prompt per request, plus the transparent auto-retry.
-  const makeStream = async (_attempt: number): Promise<AsyncIterable<CursorTextEvent>> => {
+  const credentialPinned = Boolean(continuation && continuation.link.credentialId === credential.id);
+  const reused = credentialPinned;
+  const baseSessionKey = reused ? continuation!.link.sessionKey : `cc-${crypto.randomUUID()}`;
+  if (continuation && !reused) anthropicSessionLinks.clearSession(continuation.link.sessionKey);
+  const incrementalPrompt = reused ? prepared.incrementalPrompt : undefined;
+  let activeSessionKey = baseSessionKey;
+
+  console.info(JSON.stringify({
+    event: "claude_session_route",
+    source: continuation ? "tool_result" : "fresh",
+    reused,
+    credentialPinned,
+    incrementalPromptChars: incrementalPrompt?.text.length ?? 0
+  }));
+
+  const makeStream = async (attempt: number): Promise<AsyncIterable<CursorTextEvent>> => {
+    if (attempt > 0) {
+      anthropicSessionLinks.clearSession(activeSessionKey);
+      activeSessionKey = `cc-retry-${crypto.randomUUID()}`;
+    }
     const completion = await createCursorSdkCompletion(env, deps, apiKey, {
       prompt: prepared.prompt,
       model: prepared.cursorModel,
-      sessionKey: `cc-${crypto.randomUUID()}`,
+      sessionKey: activeSessionKey,
       sessionOwnerKey: sdkSessionOwner(apiKey),
+      incrementalPrompt: attempt === 0 && reused ? incrementalPrompt : undefined,
       workingDirectory: prepared.toolContext?.workingDirectory,
       clientTools: prepared.tools,
       requiresLocalTool: prepared.requiresLocalTool,
@@ -954,6 +1008,16 @@ async function handleAnthropicMessagesWithKey(
     return completion.stream;
   };
   const stream = retryingSdkStream(makeStream);
+  const rememberToolUse = (toolUseId: string): void => {
+    anthropicSessionLinks.remember(toolUseId, {
+      sessionKey: activeSessionKey,
+      credentialId: credential.id
+    });
+  };
+  const cleanupFailedSession = (error: unknown): void => {
+    anthropicSessionLinks.clearSession(activeSessionKey);
+    onBillingError?.(error);
+  };
 
   if (prepared.stream) {
     return anthropicSseResponse(anthropicSseEvents({
@@ -962,23 +1026,30 @@ async function handleAnthropicMessagesWithKey(
       inputTokens,
       stream,
       tools: prepared.tools,
-      toolContext: prepared.toolContext
-    }), onBillingError);
+      toolContext: prepared.toolContext,
+      onToolUse: rememberToolUse
+    }), cleanupFailedSession);
   }
 
-  const output = await collectCursorSdkOutput(stream);
-  return json(
-    anthropicMessage({
-      id,
-      model: requestedModel,
-      text: output.text,
-      toolCalls: output.toolCalls,
-      tools: prepared.tools,
-      toolContext: prepared.toolContext,
-      inputTokens,
-      outputTokens: estimateTokens(output.text.length)
-    })
-  );
+  try {
+    const output = await collectCursorSdkOutput(stream);
+    return json(
+      anthropicMessage({
+        id,
+        model: requestedModel,
+        text: output.text,
+        toolCalls: output.toolCalls,
+        tools: prepared.tools,
+        toolContext: prepared.toolContext,
+        inputTokens,
+        outputTokens: estimateTokens(output.text.length),
+        onToolUse: rememberToolUse
+      })
+    );
+  } catch (error) {
+    cleanupFailedSession(error);
+    throw error;
+  }
 }
 
 /** `POST /v1/messages/count_tokens` — Claude Code's pre-send estimate. Uses the
@@ -998,7 +1069,7 @@ async function handleSdkRoute(
   apiKey: string,
   id: string,
   created: number,
-  incrementalPrompt?: ReturnType<typeof prepareChatRequest>["prompt"],
+  incrementalPrompt?: PreparedRequest["incrementalPrompt"],
   onBillingError?: (error: unknown) => void
 ): Promise<Response> {
   logToolForwarding(kind, prepared);
@@ -1096,7 +1167,8 @@ function logToolForwarding(surface: string, prepared: PreparedRequest): void {
     surface,
     mode: prepared.prompt.mode,
     toolCount: prepared.tools.length,
-    toolNames: prepared.tools.map((tool) => tool.name),
+    toolNames: prepared.tools.slice(0, 12).map((tool) => tool.name),
+    toolNamesTruncated: Math.max(0, prepared.tools.length - 12),
     requiresLocalTool: prepared.requiresLocalTool
   }));
 }
@@ -1113,146 +1185,6 @@ function handleResponseState(request: Request, responseId: string): Response {
     return json({ id: responseId, object: "response", deleted: true });
   }
   return notFound();
-}
-
-// ---------------------------------------------------------------------------
-// Streaming glue. This mirrors `streamOpenAiEvents` from `worker/index.ts` but
-// runs the pump directly (no `ExecutionContext.waitUntil`) and skips the
-// request-log bookkeeping that only exists on the hosted proxy path.
-// ---------------------------------------------------------------------------
-
-interface StreamInput {
-  id: string;
-  created: number;
-  model: string;
-  promptChars: number;
-  includeUsage: boolean;
-  metadata?: Record<string, unknown>;
-  tools: OpenAiToolSpec[];
-  context?: ToolCallContext;
-  onDone?: (text: string, completionChars: number, toolCalls: OpenAiToolCall[]) => void;
-  onError?: (error: unknown) => void | Promise<void>;
-}
-
-function streamOpenAiResponse(kind: "chat" | "responses", cursorStream: Response, input: StreamInput): Response {
-  return streamOpenAiEvents(kind, streamCursorText(cursorStream), input);
-}
-
-function streamOpenAiEvents(
-  kind: "chat" | "responses",
-  cursorEvents: AsyncIterable<CursorTextEvent>,
-  input: StreamInput
-): Response {
-  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
-  const writer = writable.getWriter();
-  const pump = async () => {
-    let text = "";
-    let toolCallCount = 0;
-    let finishReason: "stop" | "tool_calls" = "stop";
-    const streamedToolCalls: OpenAiToolCall[] = [];
-    let responseNextOutputIndex = 0;
-    let responseTextOutputIndex: number | null = null;
-    try {
-      if (kind === "chat") {
-        await writer.write(chatChunk({ id: input.id, created: input.created, model: input.model, role: "assistant" }));
-      } else {
-        for (const event of responseCreatedEvents(input)) await writer.write(event);
-      }
-
-      for await (const event of cursorEvents) {
-        if (event.type === "text" && event.text) {
-          text += event.text;
-          if (kind === "chat") {
-            await writer.write(chatChunk({ id: input.id, created: input.created, model: input.model, delta: event.text }));
-          } else {
-            if (responseTextOutputIndex === null) {
-              responseTextOutputIndex = responseNextOutputIndex;
-              responseNextOutputIndex += 1;
-              for (const chunk of responseTextStartEvents({ id: input.id, outputIndex: responseTextOutputIndex })) {
-                await writer.write(chunk);
-              }
-            }
-            await writer.write(responseDeltaEvent({ id: input.id, delta: event.text, outputIndex: responseTextOutputIndex }));
-          }
-        }
-        if (event.type === "tool_call") {
-          const [toolCall] = toOpenAiToolCalls({
-            toolCalls: [event.toolCall],
-            tools: input.tools,
-            responseId: input.id,
-            startIndex: toolCallCount,
-            context: input.context
-          });
-          if (!toolCall) continue;
-          finishReason = "tool_calls";
-          streamedToolCalls.push(toolCall);
-          if (kind === "chat") {
-            await writer.write(
-              chatChunk({ id: input.id, created: input.created, model: input.model, toolCall: { index: toolCallCount, value: toolCall } })
-            );
-          } else {
-            for (const chunk of responseToolCallEvents({ id: input.id, toolCall, outputIndex: responseNextOutputIndex })) {
-              await writer.write(chunk);
-            }
-            responseNextOutputIndex += 1;
-          }
-          toolCallCount += 1;
-        }
-        if (event.type === "done") {
-          text = event.finalText;
-        }
-      }
-
-      if (kind === "chat") {
-        const completionChars = completionCharsFromOutput(text, streamedToolCalls);
-        await writer.write(chatChunk({ id: input.id, created: input.created, model: input.model, finish: true, finishReason }));
-        if (input.includeUsage) {
-          await writer.write(
-            chatUsageChunk({
-              id: input.id,
-              created: input.created,
-              model: input.model,
-              promptChars: input.promptChars,
-              completionChars
-            })
-          );
-        }
-        await writer.write(doneChunk());
-      } else {
-        if (responseTextOutputIndex === null && !streamedToolCalls.length) {
-          responseTextOutputIndex = responseNextOutputIndex;
-          responseNextOutputIndex += 1;
-          for (const chunk of responseTextStartEvents({ id: input.id, outputIndex: responseTextOutputIndex })) {
-            await writer.write(chunk);
-          }
-        }
-        for (const event of responseDoneEvents({
-          ...input,
-          text,
-          toolCalls: streamedToolCalls,
-          textStarted: responseTextOutputIndex !== null,
-          textOutputIndex: responseTextOutputIndex ?? 0
-        })) {
-          await writer.write(event);
-        }
-      }
-      input.onDone?.(text, completionCharsFromOutput(text, streamedToolCalls), streamedToolCalls);
-    } catch (error) {
-      await input.onError?.(error);
-      const message = error instanceof Error ? error.message : "Stream failed";
-      await writer
-        .write(
-          kind === "responses"
-            ? responseErrorEvent(message)
-            : encodeSse({ error: { message, type: "cursor_error", code: "cursor_stream_error" } }, "error")
-        )
-        .catch(() => undefined);
-    } finally {
-      await writer.close().catch(() => undefined);
-    }
-  };
-  void pump();
-  return sseResponse(readable);
 }
 
 function staticContentType(filePath: string): string {
@@ -1419,13 +1351,28 @@ function toWebRequest(req: IncomingMessage, port: number): Request {
       headers.set(key, value);
     }
   }
+  headers.set("x-cursor2api-remote-address", req.socket.remoteAddress || "unknown");
 
   const init: RequestInit = { method, headers };
   if (method !== "GET" && method !== "HEAD") {
     const chunks: Buffer[] = [];
+    let bodyBytes = 0;
+    let overflow = false;
     const bodyPromise = new Promise<Buffer>((resolve, reject) => {
-      req.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
-      req.on("end", () => resolve(Buffer.concat(chunks)));
+      req.on("data", (chunk) => {
+        if (overflow) return;
+        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        bodyBytes += bytes.length;
+        if (bodyBytes > MAX_REQUEST_BODY_BYTES) {
+          overflow = true;
+          reject(new HttpError("Request body too large", 413, "request_too_large"));
+          return;
+        }
+        chunks.push(bytes);
+      });
+      req.on("end", () => {
+        if (!overflow) resolve(Buffer.concat(chunks, bodyBytes));
+      });
       req.on("error", reject);
     });
     // Materialize the body synchronously-ish: callers await `route`, which
@@ -1442,31 +1389,6 @@ function toWebRequest(req: IncomingMessage, port: number): Request {
   return new Request(url, init);
 }
 
-async function writeWebResponse(res: ServerResponse, response: Response): Promise<void> {
-  const headers: Record<string, string> = {};
-  response.headers.forEach((value, key) => {
-    headers[key] = value;
-  });
-  res.writeHead(response.status, headers);
-
-  if (!response.body) {
-    res.end();
-    return;
-  }
-
-  const reader = response.body.getReader();
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      if (value) res.write(Buffer.from(value));
-    }
-  } finally {
-    reader.releaseLock();
-    res.end();
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Boot.
 // ---------------------------------------------------------------------------
@@ -1481,16 +1403,28 @@ function parsePort(): number {
 function main(): void {
   const port = parsePort();
   const server = createServer((req, res) => {
-    const request = toWebRequest(req, port);
-    route(request, port)
-      .then((response) => writeWebResponse(res, response))
-      .catch((error) => {
-        const response = errorResponse(error);
-        writeWebResponse(res, response).catch(() => {
-          if (!res.headersSent) res.writeHead(500);
-          res.end();
+    const controller = new AbortController();
+    bindDownstreamAbort(req, res, controller, (reason) => {
+      console.info(JSON.stringify({
+        event: "downstream_disconnect",
+        reason,
+        method: req.method || "",
+        path: req.url || ""
+      }));
+    });
+
+    runWithDownstreamSignal(controller.signal, () => {
+      const request = toWebRequest(req, port);
+      route(request, port)
+        .then((response) => writeWebResponse(res, response))
+        .catch((error) => {
+          const response = errorResponse(error);
+          writeWebResponse(res, response).catch(() => {
+            if (!res.headersSent) res.writeHead(500);
+            res.end();
+          });
         });
-      });
+    });
   });
 
   server.listen(port, HOST, () => {

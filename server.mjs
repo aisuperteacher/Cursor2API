@@ -311,7 +311,9 @@ async function cmdStart(flags) {
     CURSOR_SDK_BRIDGE_HOST: host,
     CURSOR_SDK_BRIDGE_PORT: String(bridgePort),
     CURSOR_SDK_BRIDGE_TOKEN: bridgeToken,
-    CURSOR_SDK_BRIDGE_RUN_TIMEOUT_MS: "180000"
+    CURSOR_SDK_BRIDGE_IDLE_TIMEOUT_MS:
+      process.env.CURSOR_SDK_BRIDGE_IDLE_TIMEOUT_MS || process.env.CURSOR_SDK_BRIDGE_RUN_TIMEOUT_MS || "300000",
+    CURSOR_SDK_BRIDGE_HARD_TIMEOUT_MS: process.env.CURSOR_SDK_BRIDGE_HARD_TIMEOUT_MS || "600000"
   };
 
   const bridge = spawnLogged(

@@ -231,3 +231,42 @@ describe("anthropicSseEvents", () => {
     expect((out[7].data as any).delta.stop_reason).toBe("tool_use");
   });
 });
+
+
+describe("tool_use continuation callbacks", () => {
+  test("non-stream messages expose the generated tool_use id", () => {
+    const seen: string[] = [];
+    const message = anthropicMessage({
+      id: "msg_test",
+      model: "composer-2.5",
+      text: "",
+      toolCalls: [{ name: "read", arguments: { path: "README.md" } }],
+      inputTokens: 1,
+      outputTokens: 1,
+      onToolUse: (toolUseId) => seen.push(toolUseId)
+    });
+    const block = (message.content as Array<Record<string, unknown>>)[0];
+    expect(seen).toEqual([block.id as string]);
+  });
+
+  test("streaming tool_use emits the callback before the terminal message", async () => {
+    const seen: string[] = [];
+    async function* stream(): AsyncGenerator<CursorTextEvent> {
+      yield { type: "tool_call", toolCall: { name: "read", arguments: { path: "README.md" } } };
+      yield { type: "done", finalText: "", toolCalls: [] };
+    }
+    const events = [];
+    for await (const event of anthropicSseEvents({
+      id: "msg_stream",
+      model: "composer-2.5",
+      inputTokens: 1,
+      stream: stream(),
+      onToolUse: (toolUseId) => seen.push(toolUseId)
+    })) events.push(event);
+    const start = events.find((event) => event.event === "content_block_start" && event.data.content_block && (event.data.content_block as Record<string, unknown>).type === "tool_use");
+    const toolUseId = ((start?.data.content_block as Record<string, unknown>)?.id ?? "") as string;
+    expect(toolUseId).toBeTruthy();
+    expect(seen).toEqual([toolUseId]);
+    expect(events.at(-1)?.event).toBe("message_stop");
+  });
+});
