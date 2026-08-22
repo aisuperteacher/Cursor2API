@@ -415,12 +415,26 @@ async function runLocalAgentUnlocked(input, onEvent) {
       return await Promise.race([work, timeoutControl.promise, abortControl.promise]);
     } catch (error) {
       work.catch(() => {});
-      const authenticationFailure = isAuthenticationSDKError(error);
+      const clientAborted = Boolean(input.signal?.aborted || isBenignCancellationError(error));
+      const authenticationFailure = !clientAborted && isAuthenticationSDKError(error);
       const shouldRetry =
+        !clientAborted &&
         attempt < maxRunRetries &&
         !emittedOutputEvent &&
         (authenticationFailure || isRetryableSDKRunError(error));
       if (activeRun) activeRun.cancel().catch(() => {});
+
+      if (clientAborted) {
+        const evicted = evictCachedAgent(input);
+        console.info(JSON.stringify({
+          event: "sdk_agent_evicted",
+          requestId: input.requestId,
+          reason: "client_abort",
+          evicted
+        }));
+        throw error;
+      }
+
       if (authenticationFailure) {
         resetAgentRuntime("expired SDK authentication");
       }
@@ -621,7 +635,9 @@ function evictAgent(cacheKey, agent) {
 function evictCachedAgent(input) {
   const cacheKey = agentCacheKey(input);
   const cached = agentCache.get(cacheKey);
-  if (cached) evictAgent(cacheKey, cached.agent);
+  if (!cached) return false;
+  evictAgent(cacheKey, cached.agent);
+  return true;
 }
 
 function resetAgentRuntime(reason) {
