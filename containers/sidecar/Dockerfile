@@ -5,10 +5,15 @@ WORKDIR /src
 COPY worker ./worker
 COPY sidecar ./sidecar
 
-# Bundle the API and Bun runtime into one executable so the production image
-# does not need the source tree or a JavaScript package manager at runtime.
+# Bundle application code for the Node runtime. We intentionally do not use
+# `bun build --compile` here: the sidecar relies on node:http socket lifecycle
+# events to cancel upstream SDK runs when a streaming client disconnects, and
+# those events must use Node's native HTTP implementation at runtime.
 RUN mkdir -p /out \
-  && bun build sidecar/server-entry.ts --compile --outfile /out/api-for-cursor
+  && bun build sidecar/server-entry.ts \
+    --target=node \
+    --format=esm \
+    --outfile /out/api-for-cursor.mjs
 
 FROM node:22-bookworm-slim AS web
 
@@ -23,7 +28,7 @@ COPY public ./public
 
 RUN npm run build:client
 
-FROM debian:bookworm-slim
+FROM node:22-bookworm-slim
 
 RUN apt-get update \
   && apt-get install --no-install-recommends -y ca-certificates curl \
@@ -32,7 +37,7 @@ RUN apt-get update \
   && mkdir -p /var/lib/api-for-cursor \
   && chown api:api /var/lib/api-for-cursor
 
-COPY --from=build /out/api-for-cursor /usr/local/bin/api-for-cursor
+COPY --from=build /out/api-for-cursor.mjs /usr/local/lib/api-for-cursor.mjs
 COPY --from=web /src/dist/client /opt/api-for-cursor/public
 
 ENV NODE_ENV=production \
@@ -48,4 +53,4 @@ HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=12 \
 
 USER api
 
-ENTRYPOINT ["/usr/local/bin/api-for-cursor"]
+ENTRYPOINT ["node", "/usr/local/lib/api-for-cursor.mjs"]
