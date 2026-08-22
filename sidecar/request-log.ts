@@ -9,6 +9,7 @@ export interface RequestLogEntry {
   method: string;
   path: string;
   model?: string;
+  reasoningEffort?: string;
   streaming?: boolean;
   clientKeyId?: string;
   clientKeyLabel?: string;
@@ -25,11 +26,18 @@ export interface RequestLogEntry {
 
 export interface RequestLogQuery {
   limit?: number;
+  cursor?: string;
   result?: RequestLogResult | "";
   path?: string;
   model?: string;
   clientKeyId?: string;
   credentialId?: string;
+}
+
+export interface RequestLogPage {
+  data: RequestLogEntry[];
+  hasMore: boolean;
+  nextCursor?: string;
 }
 
 export interface RequestLogStorageStats {
@@ -89,10 +97,15 @@ interface LogFileInfo {
   current: boolean;
 }
 
+interface RequestLogCursor {
+  id: string;
+  timestamp: string;
+}
+
 const CURRENT_FILE = "requests.jsonl";
 const LOG_FILE_PATTERN = /^requests(?:-\d+-\d+)?\.jsonl$/;
-const DEFAULT_QUERY_LIMIT = 100;
-const MAX_QUERY_LIMIT = 500;
+const DEFAULT_QUERY_LIMIT = 10;
+const MAX_QUERY_LIMIT = 50;
 const USAGE_SAMPLE_LIMIT = 50_000;
 
 export class RequestLogStore {
@@ -155,12 +168,14 @@ export class RequestLogStore {
     });
   }
 
-  async list(query: RequestLogQuery = {}): Promise<{ data: RequestLogEntry[]; hasMore: boolean }> {
+  async list(query: RequestLogQuery = {}): Promise<RequestLogPage> {
     if (!this.enabled) return { data: [], hasMore: false };
     await this.queue;
     const limit = Math.min(MAX_QUERY_LIMIT, Math.max(1, Math.trunc(query.limit || DEFAULT_QUERY_LIMIT)));
+    const cursor = decodeCursor(query.cursor);
+    const cursorTimestamp = cursor ? Date.parse(cursor.timestamp) : Number.NaN;
     const data: RequestLogEntry[] = [];
-    let hasMore = false;
+    let afterCursor = !cursor;
     const files = (await this.logFiles()).sort((left, right) => right.mtimeMs - left.mtimeMs);
 
     for (const file of files) {
@@ -169,14 +184,28 @@ export class RequestLogStore {
       for (let index = lines.length - 1; index >= 0; index -= 1) {
         const entry = parseEntry(lines[index]);
         if (!entry || !matchesQuery(entry, query)) continue;
-        if (data.length < limit) data.push(entry);
-        else {
-          hasMore = true;
-          return { data, hasMore };
+
+        if (!afterCursor && cursor) {
+          if (entry.id === cursor.id && entry.timestamp === cursor.timestamp) {
+            afterCursor = true;
+            continue;
+          }
+          const entryTimestamp = Date.parse(entry.timestamp);
+          if (Number.isFinite(cursorTimestamp) && Number.isFinite(entryTimestamp) && entryTimestamp < cursorTimestamp) {
+            afterCursor = true;
+          } else {
+            continue;
+          }
         }
+
+        if (data.length < limit) {
+          data.push(entry);
+          continue;
+        }
+        return pageResult(data, true);
       }
     }
-    return { data, hasMore };
+    return pageResult(data, false);
   }
 
   async usageSummary(): Promise<GatewayUsageSummary> {
@@ -344,6 +373,27 @@ export class RequestLogStore {
   }
 }
 
+function pageResult(data: RequestLogEntry[], hasMore: boolean): RequestLogPage {
+  if (!hasMore || !data.length) return { data, hasMore };
+  return { data, hasMore, nextCursor: encodeCursor(data[data.length - 1]) };
+}
+
+function encodeCursor(entry: RequestLogEntry): string {
+  return Buffer.from(JSON.stringify({ id: entry.id, timestamp: entry.timestamp }), "utf8").toString("base64url");
+}
+
+function decodeCursor(value: string | undefined): RequestLogCursor | null {
+  if (!value || value.length > 1024) return null;
+  try {
+    const decoded = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as Partial<RequestLogCursor>;
+    if (typeof decoded.id !== "string" || !decoded.id || typeof decoded.timestamp !== "string") return null;
+    if (!Number.isFinite(Date.parse(decoded.timestamp))) return null;
+    return { id: decoded.id.slice(0, 120), timestamp: new Date(decoded.timestamp).toISOString() };
+  } catch {
+    return null;
+  }
+}
+
 function sanitizeEntry(entry: RequestLogEntry): RequestLogEntry {
   return {
     id: stringValue(entry.id, 120),
@@ -351,6 +401,7 @@ function sanitizeEntry(entry: RequestLogEntry): RequestLogEntry {
     method: stringValue(entry.method, 16).toUpperCase(),
     path: stringValue(entry.path, 500),
     ...(entry.model ? { model: stringValue(entry.model, 160) } : {}),
+    ...(entry.reasoningEffort ? { reasoningEffort: stringValue(entry.reasoningEffort, 64) } : {}),
     ...(entry.streaming !== undefined ? { streaming: Boolean(entry.streaming) } : {}),
     ...(entry.clientKeyId ? { clientKeyId: stringValue(entry.clientKeyId, 120) } : {}),
     ...(entry.clientKeyLabel ? { clientKeyLabel: stringValue(entry.clientKeyLabel, 160) } : {}),
