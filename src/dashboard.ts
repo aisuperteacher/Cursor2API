@@ -1,4 +1,7 @@
 import "./dashboard-observability.css";
+// Polish must cascade after the observability base styles; importing it here (in
+// the same lazy chunk) guarantees its overrides win the cascade.
+import "./dashboard-polish.css";
 import { escapeHtml, icon, hydrateIcons } from "./ui";
 
 interface CredentialUsage {
@@ -210,7 +213,12 @@ function mountConsole(root: HTMLElement): void {
     state.logPage = 1;
   };
 
+  // In-flight log requests are superseded by newer ones so a slow response can
+  // never overwrite the page the user has navigated to meanwhile.
+  let refreshLogsSeq = 0;
+
   const refreshLogs = async (reset = false): Promise<void> => {
+    const token = ++refreshLogsSeq;
     if (reset) resetLogPaging();
     const params = new URLSearchParams();
     params.set("limit", root.querySelector<HTMLSelectElement>("#log-limit")?.value || "10");
@@ -222,6 +230,7 @@ function mountConsole(root: HTMLElement): void {
     if (model) params.set("model", model);
     if (path) params.set("path", path);
     const response = await requestJson<{ data: RequestLogEntry[]; hasMore: boolean; nextCursor?: string }>(`/api/request-logs?${params}`);
+    if (token !== refreshLogsSeq) return;
     state.logs = response.data;
     state.logsHaveMore = response.hasMore;
     state.logNextCursor = response.nextCursor || "";
@@ -229,13 +238,20 @@ function mountConsole(root: HTMLElement): void {
       if (state.logPage <= 1) return;
       state.logCursor = state.logCursorHistory.pop() || "";
       state.logPage = Math.max(1, state.logPage - 1);
-      void refreshLogs();
+      loadLogs();
     }, () => {
       if (!state.logsHaveMore || !state.logNextCursor) return;
       state.logCursorHistory.push(state.logCursor);
       state.logCursor = state.logNextCursor;
       state.logPage += 1;
-      void refreshLogs();
+      loadLogs();
+    });
+  };
+
+  const loadLogs = (reset = false): void => {
+    void refreshLogs(reset).catch((error) => {
+      renderPanelError(root, "#request-log-list", "请求日志加载失败", error);
+      notice(error instanceof Error ? error.message : "日志加载失败", true);
     });
   };
 
@@ -255,8 +271,19 @@ function mountConsole(root: HTMLElement): void {
       state.clientKeys = keys.data || [];
       state.settings = settings;
       renderCore(root, state, refresh, notice);
-      await Promise.all([refreshLogs(true), refreshUsage()]);
-      notice("");
+      // Logs and usage are observability extras: a failure there (e.g. an older
+      // server build without these endpoints) must not wedge the panels on
+      // "loading", and must not hide the core account/key data either.
+      const [logsResult, usageResult] = await Promise.allSettled([refreshLogs(true), refreshUsage()]);
+      if (logsResult.status === "rejected") renderPanelError(root, "#request-log-list", "请求日志加载失败", logsResult.reason);
+      if (usageResult.status === "rejected") renderPanelError(root, "#usage-panel", "用量数据加载失败", usageResult.reason);
+      if (logsResult.status === "rejected") {
+        notice(logsResult.reason instanceof Error ? logsResult.reason.message : "日志加载失败", true);
+      } else if (usageResult.status === "rejected") {
+        notice(usageResult.reason instanceof Error ? usageResult.reason.message : "用量加载失败", true);
+      } else {
+        notice("");
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : "加载失败";
       if (/401|unauthor/i.test(message)) {
@@ -273,15 +300,18 @@ function mountConsole(root: HTMLElement): void {
   root.querySelector("#import-accounts")?.addEventListener("click", () => accountDialog.showModal());
   root.querySelector("#cancel-account")?.addEventListener("click", () => accountDialog.close());
   root.querySelector("#refresh-all")?.addEventListener("click", () => void refresh());
-  root.querySelector("#refresh-logs")?.addEventListener("click", () => void refreshLogs(true).catch((error) => notice(error instanceof Error ? error.message : "日志刷新失败", true)));
-  root.querySelector("#refresh-usage")?.addEventListener("click", () => void refreshUsage().catch((error) => notice(error instanceof Error ? error.message : "用量刷新失败", true)));
-  root.querySelector("#log-result")?.addEventListener("change", () => void refreshLogs(true));
-  root.querySelector("#log-limit")?.addEventListener("change", () => void refreshLogs(true));
-  root.querySelector("#log-model")?.addEventListener("change", () => void refreshLogs(true));
-  root.querySelector("#log-path")?.addEventListener("change", () => void refreshLogs(true));
+  root.querySelector("#refresh-logs")?.addEventListener("click", () => loadLogs(true));
+  root.querySelector("#refresh-usage")?.addEventListener("click", () => void refreshUsage().catch((error) => {
+    renderPanelError(root, "#usage-panel", "用量数据加载失败", error);
+    notice(error instanceof Error ? error.message : "用量刷新失败", true);
+  }));
+  root.querySelector("#log-result")?.addEventListener("change", () => loadLogs(true));
+  root.querySelector("#log-limit")?.addEventListener("change", () => loadLogs(true));
+  root.querySelector("#log-model")?.addEventListener("change", () => loadLogs(true));
+  root.querySelector("#log-path")?.addEventListener("change", () => loadLogs(true));
   ["#log-model", "#log-path"].forEach((selector) => {
     root.querySelector<HTMLInputElement>(selector)?.addEventListener("keydown", (event) => {
-      if (event.key === "Enter") void refreshLogs(true);
+      if (event.key === "Enter") loadLogs(true);
     });
   });
   root.querySelector("#logout")?.addEventListener("click", () => {
@@ -374,17 +404,19 @@ function consoleMarkup(): string {
   return `
     <div class="dashboard-shell console-shell">
       <aside class="console-sidebar">
-        <a class="console-brand" href="/">
+        <a class="console-brand" href="/" aria-label="Cursor Gateway 控制台首页">
           <span class="console-brand-mark"><img src="/api-for-cursor-icon.png" width="34" height="34" alt=""/></span>
           <span><strong>Cursor Gateway</strong><small>Control Console</small></span>
         </a>
+        <!-- The label + title stay available to assistive tech and tooltips even
+             when the sidebar collapses to icons and the visible span is hidden. -->
         <nav class="console-nav" aria-label="控制台导航">
-          <a href="#overview">${icon("MonitorDot", { width: 17, height: 17 })}<span>概览</span></a>
-          <a href="#connection">${icon("Server", { width: 17, height: 17 })}<span>客户端接入</span></a>
-          <a href="#credentials">${icon("User", { width: 17, height: 17 })}<span>Cursor 账号</span></a>
-          <a href="#usage">${icon("Zap", { width: 17, height: 17 })}<span>用量与额度</span></a>
-          <a href="#request-logs">${icon("Terminal", { width: 17, height: 17 })}<span>请求日志</span></a>
-          <a href="#client-keys">${icon("KeyRound", { width: 17, height: 17 })}<span>客户端 Keys</span></a>
+          <a href="#overview" aria-label="概览" title="概览">${icon("MonitorDot", { width: 17, height: 17 })}<span>概览</span></a>
+          <a href="#connection" aria-label="客户端接入" title="客户端接入">${icon("Server", { width: 17, height: 17 })}<span>客户端接入</span></a>
+          <a href="#credentials" aria-label="Cursor 账号" title="Cursor 账号">${icon("User", { width: 17, height: 17 })}<span>Cursor 账号</span></a>
+          <a href="#usage" aria-label="用量与额度" title="用量与额度">${icon("Zap", { width: 17, height: 17 })}<span>用量与额度</span></a>
+          <a href="#request-logs" aria-label="请求日志" title="请求日志">${icon("Terminal", { width: 17, height: 17 })}<span>请求日志</span></a>
+          <a href="#client-keys" aria-label="客户端 Keys" title="客户端 Keys">${icon("KeyRound", { width: 17, height: 17 })}<span>客户端 Keys</span></a>
         </nav>
         <div class="console-sidebar-note">
           <span class="console-status-dot"></span>
@@ -631,6 +663,18 @@ function renderClientKeys(
         .finally(() => { button.disabled = false; });
     });
   });
+}
+
+/** Replace a panel's loading state with an inline error instead of leaving it spinning forever. */
+function renderPanelError(root: HTMLElement, selector: string, title: string, error: unknown): void {
+  const panel = root.querySelector<HTMLElement>(selector);
+  if (!panel) return;
+  const message = error instanceof Error ? error.message : "加载失败";
+  const hint = /not found/i.test(message)
+    ? "当前服务未提供该接口；请升级到包含可观测功能的版本，或检查部署配置。"
+    : "请稍后重试，或检查服务运行状态。";
+  const compact = selector === "#usage-panel" ? " compact" : "";
+  panel.innerHTML = `<div class="empty-state${compact}"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(message)}。${escapeHtml(hint)}</span></div>`;
 }
 
 function renderUsage(root: HTMLElement, usage: UsageResponse): void {

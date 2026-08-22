@@ -4,7 +4,9 @@
   --bg-2: #eceae3;
   --ink: #1d1d1f;
   --ink-soft: #5c5c63;
-  --ink-faint: #8a8a92;
+  /* #6b6b74 keeps small text at >= 4.5:1 against the light background (WCAG AA);
+     the previous #8a8a92 measured ~3:1. */
+  --ink-faint: #6b6b74;
   --line: rgba(0, 0, 0, 0.08);
   --line-strong: rgba(0, 0, 0, 0.14);
 
