@@ -64,5 +64,8 @@ jobs:
       - name: Build client
         run: npm run build:client
 
+      - name: Test dashboard sidebar navigation in Chrome
+        run: node scripts/dashboard-nav-e2e.mjs
+
       - name: Check bridge syntax
         run: node --check scripts/cursor-sdk-local-agent-bridge.mjs
