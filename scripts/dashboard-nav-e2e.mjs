@@ -39,13 +39,28 @@ function capture(stream, target) {
   });
 }
 
-function stopProcess(child) {
+async function stopProcess(child) {
   if (!child || child.exitCode !== null || !child.pid) return;
+  const exited = new Promise((resolvePromise) => child.once("exit", resolvePromise));
   try {
     process.kill(-child.pid, "SIGTERM");
   } catch {
-    try { child.kill("SIGTERM"); } catch { /* already stopped */ }
+    try { child.kill("SIGTERM"); } catch { return; }
   }
+  await Promise.race([
+    exited,
+    new Promise((resolvePromise) => setTimeout(resolvePromise, 3_000))
+  ]);
+  if (child.exitCode !== null) return;
+  try {
+    process.kill(-child.pid, "SIGKILL");
+  } catch {
+    try { child.kill("SIGKILL"); } catch { /* already stopped */ }
+  }
+  await Promise.race([
+    exited,
+    new Promise((resolvePromise) => setTimeout(resolvePromise, 1_000))
+  ]);
 }
 
 async function waitFor(description, callback, timeoutMs = 20_000) {
@@ -127,7 +142,11 @@ async function navSnapshot() {
       background: getComputedStyle(anchor).backgroundColor,
       color: getComputedStyle(anchor).color
     }));
-    return { hash: window.location.hash, links };
+    return {
+      hash: window.location.hash,
+      activeSection: document.querySelector('.console-nav')?.getAttribute('data-active-section') || '',
+      links
+    };
   })()`);
 }
 
@@ -136,6 +155,10 @@ function assertNavSnapshot(snapshot, expectedHash) {
     throw new Error(`Expected hash ${expectedHash || "<empty>"}, received ${snapshot.hash || "<empty>"}`);
   }
   const expectedHref = expectedHash || "#overview";
+  const expectedSection = expectedHref.slice(1);
+  if (snapshot.activeSection && snapshot.activeSection !== expectedSection) {
+    throw new Error(`Expected data-active-section=${expectedSection}, received ${snapshot.activeSection}`);
+  }
   const explicitActive = snapshot.links.filter((item) => item.active || item.ariaCurrent === "page");
   if (explicitActive.length !== 1 || explicitActive[0].href !== expectedHref) {
     throw new Error(`Expected exactly one explicit active item (${expectedHref}), received ${JSON.stringify(explicitActive)}`);
@@ -263,7 +286,12 @@ try {
   process.exitCode = 1;
 } finally {
   try { cdp?.close(); } catch { /* ignore cleanup errors */ }
-  stopProcess(chromeProcess);
-  stopProcess(serverProcess);
-  rmSync(temporaryDir, { recursive: true, force: true });
+  await stopProcess(chromeProcess);
+  await stopProcess(serverProcess);
+  rmSync(temporaryDir, {
+    recursive: true,
+    force: true,
+    maxRetries: 20,
+    retryDelay: 100
+  });
 }
