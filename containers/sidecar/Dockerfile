@@ -8,7 +8,7 @@ COPY sidecar ./sidecar
 # Bundle the API and Bun runtime into one executable so the production image
 # does not need the source tree or a JavaScript package manager at runtime.
 RUN mkdir -p /out \
-  && bun build sidecar/server.ts --compile --outfile /out/api-for-cursor
+  && bun build sidecar/server-entry.ts --compile --outfile /out/api-for-cursor
 
 FROM node:22-bookworm-slim AS web
 
