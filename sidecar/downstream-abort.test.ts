@@ -37,6 +37,19 @@ describe("downstream abort propagation", () => {
     expect(combined?.aborted).toBe(true);
   });
 
+  test("socket end aborts an unfinished streaming response before socket close", () => {
+    const request = new FakeRequest();
+    const response = new FakeResponse();
+    const controller = new AbortController();
+    const reasons: string[] = [];
+
+    bindDownstreamAbort(request as any, response as any, controller, (reason) => reasons.push(reason));
+    request.socket.emit("end");
+
+    expect(controller.signal.aborted).toBe(true);
+    expect(reasons).toEqual(["socket_end"]);
+  });
+
   test("socket close aborts an unfinished response even when response close is absent", () => {
     const request = new FakeRequest();
     const response = new FakeResponse();
@@ -50,7 +63,7 @@ describe("downstream abort propagation", () => {
     expect(reasons).toEqual(["socket_close"]);
   });
 
-  test("normal response finish removes socket-close cancellation listeners", () => {
+  test("normal response finish removes socket disconnect cancellation listeners", () => {
     const request = new FakeRequest();
     const response = new FakeResponse();
     const controller = new AbortController();
@@ -59,6 +72,7 @@ describe("downstream abort propagation", () => {
     bindDownstreamAbort(request as any, response as any, controller, (reason) => reasons.push(reason));
     response.writableEnded = true;
     response.emit("finish");
+    request.socket.emit("end");
     request.socket.emit("close");
 
     expect(controller.signal.aborted).toBe(false);
