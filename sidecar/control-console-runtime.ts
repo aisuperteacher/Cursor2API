@@ -13,6 +13,7 @@ interface RuntimeRequestContext {
   method: string;
   path: string;
   model?: string;
+  reasoningEffort?: string;
   streaming?: boolean;
   clientKeyId?: string;
   clientKeyLabel?: string;
@@ -209,7 +210,8 @@ async function handleControlRoute(deps: ControlRouteDeps): Promise<void> {
 
   if (url.pathname === "/api/request-logs" && request.method === "GET") {
     const query: RequestLogQuery = {
-      limit: queryInteger(url, "limit", 100),
+      limit: queryInteger(url, "limit", 10),
+      cursor: url.searchParams.get("cursor") || "",
       result: requestLogResult(url.searchParams.get("result")),
       path: url.searchParams.get("path") || "",
       model: url.searchParams.get("model") || "",
@@ -370,6 +372,8 @@ function captureRequestMetadata(request: IncomingMessage, context: RuntimeReques
     try {
       const body = JSON.parse(Buffer.concat(chunks, bytes).toString("utf8")) as Record<string, unknown>;
       if (typeof body.model === "string") context.model = body.model.slice(0, 160);
+      const reasoningEffort = reasoningEffortFromBody(body);
+      if (reasoningEffort) context.reasoningEffort = reasoningEffort;
       if (typeof body.stream === "boolean") context.streaming = body.stream;
     } catch {
       // Request parsing and validation remains owned by the main server.
@@ -423,6 +427,7 @@ function finalizeRequestLog(
     method: context.method,
     path: context.path,
     ...(context.model ? { model: context.model } : {}),
+    ...(context.reasoningEffort ? { reasoningEffort: context.reasoningEffort } : {}),
     ...(context.streaming !== undefined ? { streaming: context.streaming } : {}),
     ...(context.clientKeyId ? { clientKeyId: context.clientKeyId } : {}),
     ...(context.clientKeyLabel ? { clientKeyLabel: context.clientKeyLabel } : {}),
@@ -475,9 +480,35 @@ function inspectBridgeRequest(
       const id = (model as Record<string, unknown>).id;
       if (typeof id === "string") context.model = id.slice(0, 160);
     }
+    if (!context.reasoningEffort) {
+      const reasoningEffort = reasoningEffortFromBody(body);
+      if (reasoningEffort) context.reasoningEffort = reasoningEffort;
+    }
   } catch {
     // Never interfere with the bridge call because observability parsing failed.
   }
+}
+
+function reasoningEffortFromBody(body: Record<string, unknown>): string {
+  if (typeof body.reasoning_effort === "string" && body.reasoning_effort.trim()) {
+    return body.reasoning_effort.trim().slice(0, 64);
+  }
+  const reasoning = body.reasoning;
+  if (reasoning && typeof reasoning === "object" && !Array.isArray(reasoning)) {
+    const effort = (reasoning as Record<string, unknown>).effort;
+    if (typeof effort === "string" && effort.trim()) return effort.trim().slice(0, 64);
+  }
+  const thinking = body.thinking;
+  if (thinking && typeof thinking === "object" && !Array.isArray(thinking)) {
+    const record = thinking as Record<string, unknown>;
+    const type = typeof record.type === "string" ? record.type.trim() : "";
+    const budget = typeof record.budget_tokens === "number" && Number.isFinite(record.budget_tokens)
+      ? Math.max(0, Math.round(record.budget_tokens))
+      : null;
+    if (type === "enabled" && budget !== null) return `thinking ${budget} tokens`;
+    if (type) return type.slice(0, 64);
+  }
+  return "";
 }
 
 function errorCodeFromPreview(preview: string): { errorCode?: string } {
