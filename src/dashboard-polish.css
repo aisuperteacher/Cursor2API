@@ -69,19 +69,14 @@
   letter-spacing: -0.01em;
 }
 
-/* Sidebar selection follows the section targeted by the hash. */
-.console-shell .console-nav a:first-child {
+/* Sidebar selection is controlled explicitly from location.hash in main.ts. */
+.console-shell .console-nav a {
   background: transparent;
   color: #aeb7c5;
 }
 
-.console-shell:not(:has(#connection:target)):not(:has(#credentials:target)):not(:has(#usage:target)):not(:has(#request-logs:target)):not(:has(#client-keys:target)) .console-nav a[href="#overview"],
-.console-shell:has(#overview:target) .console-nav a[href="#overview"],
-.console-shell:has(#connection:target) .console-nav a[href="#connection"],
-.console-shell:has(#credentials:target) .console-nav a[href="#credentials"],
-.console-shell:has(#usage:target) .console-nav a[href="#usage"],
-.console-shell:has(#request-logs:target) .console-nav a[href="#request-logs"],
-.console-shell:has(#client-keys:target) .console-nav a[href="#client-keys"] {
+.console-shell .console-nav a.is-active,
+.console-shell .console-nav a[aria-current="page"] {
   background: rgba(99, 102, 241, 0.18);
   color: #fff;
 }
