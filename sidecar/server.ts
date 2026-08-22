@@ -80,6 +80,7 @@ import { AsyncStaleCache } from "./async-stale-cache";
 import { AnthropicSessionLinkStore, preferCredential, type AnthropicContinuation } from "./anthropic-session";
 import { LocalAuthStore, sessionCookie, sessionToken } from "./auth";
 import { LoginAttemptLimiter } from "./login-limiter";
+import { bindDownstreamAbort, runWithDownstreamSignal } from "./downstream-abort";
 import { writeWebResponse } from "./node-response";
 import { streamOpenAiEvents, streamOpenAiResponse } from "../worker/openai-stream";
 
@@ -861,7 +862,9 @@ function isTransientSdkError(error: unknown): boolean {
 /**
  * Wrap an SDK event stream so a transient failure *before any event is emitted* retries
  * with a fresh attempt (the factory decides what changes per attempt). Once any event has
- * been yielded we never retry, so partial output is never duplicated.
+ * been yielded we never retry, so partial output is never duplicated. Cancellation of the
+ * outer iterator always closes the active inner iterator so cancellation can continue
+ * toward the bridge reader rather than leaving an orphaned SDK run behind.
  */
 function retryingSdkStream(
   make: (attempt: number) => Promise<AsyncIterable<CursorTextEvent>>,
@@ -872,21 +875,28 @@ function retryingSdkStream(
       for (let attempt = 0; ; attempt += 1) {
         const iterator = (await make(attempt))[Symbol.asyncIterator]();
         let emitted = false;
+        let completed = false;
         try {
           for (;;) {
             const next = await iterator.next();
-            if (next.done) return;
+            if (next.done) {
+              completed = true;
+              return;
+            }
             emitted = true;
             yield next.value;
           }
         } catch (error) {
-          try {
-            await iterator.return?.();
-          } catch {
-            /* ignore */
-          }
           if (!emitted && attempt + 1 < maxAttempts && isTransientSdkError(error)) continue;
           throw error;
+        } finally {
+          if (!completed) {
+            try {
+              await iterator.return?.();
+            } catch {
+              /* cleanup must not replace the original completion/error */
+            }
+          }
         }
       }
     }
@@ -1393,16 +1403,28 @@ function parsePort(): number {
 function main(): void {
   const port = parsePort();
   const server = createServer((req, res) => {
-    const request = toWebRequest(req, port);
-    route(request, port)
-      .then((response) => writeWebResponse(res, response))
-      .catch((error) => {
-        const response = errorResponse(error);
-        writeWebResponse(res, response).catch(() => {
-          if (!res.headersSent) res.writeHead(500);
-          res.end();
+    const controller = new AbortController();
+    bindDownstreamAbort(req, res, controller, (reason) => {
+      console.info(JSON.stringify({
+        event: "downstream_disconnect",
+        reason,
+        method: req.method || "",
+        path: req.url || ""
+      }));
+    });
+
+    runWithDownstreamSignal(controller.signal, () => {
+      const request = toWebRequest(req, port);
+      route(request, port)
+        .then((response) => writeWebResponse(res, response))
+        .catch((error) => {
+          const response = errorResponse(error);
+          writeWebResponse(res, response).catch(() => {
+            if (!res.headersSent) res.writeHead(500);
+            res.end();
+          });
         });
-      });
+    });
   });
 
   server.listen(port, HOST, () => {
