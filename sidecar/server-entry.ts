@@ -1,8 +1,11 @@
+import { installControlConsoleRuntime } from "./control-console-runtime";
 import { installDownstreamAwareFetch } from "./downstream-abort";
 
-// Install the request-context-aware fetch wrapper before loading the server.
-// The actual downstream disconnect binding lives directly in server.ts so it
-// cannot be bypassed by Bun's compile-time handling of node:http imports.
+// Install request-scoped cancellation first, then the control-console runtime.
+// The runtime patches node:http before server.ts imports its named createServer
+// binding, allowing authenticated management routes and request metadata logging
+// without duplicating the main API router.
 installDownstreamAwareFetch();
+installControlConsoleRuntime();
 
 await import("./server");
