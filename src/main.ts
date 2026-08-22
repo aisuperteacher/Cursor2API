@@ -6,9 +6,9 @@ const isDashboardRoute = (): boolean => window.location.pathname.replace(/\/+$/,
 const dashboardHashes = new Set(["#overview", "#connection", "#credentials", "#usage", "#request-logs", "#client-keys"]);
 let dashboardNavObserver: MutationObserver | null = null;
 
-function syncDashboardNav(): void {
+function syncDashboardNav(hash = window.location.hash): void {
   if (!isDashboardRoute()) return;
-  const activeHash = dashboardHashes.has(window.location.hash) ? window.location.hash : "#overview";
+  const activeHash = dashboardHashes.has(hash) ? hash : "#overview";
   document.querySelectorAll<HTMLAnchorElement>(".console-nav a[href^='#']").forEach((anchor) => {
     const active = anchor.getAttribute("href") === activeHash;
     anchor.classList.toggle("is-active", active);
@@ -76,6 +76,12 @@ document.addEventListener("click", (event) => {
   const anchor = (event.target as HTMLElement | null)?.closest("a");
   if (!anchor) return;
   const href = anchor.getAttribute("href") || "";
+
+  if (isDashboardRoute() && anchor.closest(".console-nav") && dashboardHashes.has(href)) {
+    syncDashboardNav(href);
+    return;
+  }
+
   if (href !== "/" && href !== "/chat" && href !== "/dashboard") return;
   if (anchor.target === "_blank") return;
   event.preventDefault();
@@ -85,7 +91,7 @@ document.addEventListener("click", (event) => {
   }
 });
 
-window.addEventListener("hashchange", syncDashboardNav);
+window.addEventListener("hashchange", () => syncDashboardNav());
 window.addEventListener("popstate", () => void route());
 
 let landingReady = false;
