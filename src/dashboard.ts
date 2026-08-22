@@ -42,6 +42,7 @@ interface RequestLogEntry {
   method: string;
   path: string;
   model?: string;
+  reasoningEffort?: string;
   streaming?: boolean;
   clientKeyLabel?: string;
   clientKeyHint?: string;
@@ -97,6 +98,10 @@ interface DashboardState {
   settings: Settings;
   logs: RequestLogEntry[];
   logsHaveMore: boolean;
+  logCursor: string;
+  logNextCursor: string;
+  logCursorHistory: string[];
+  logPage: number;
   usage: UsageResponse | null;
 }
 
@@ -180,6 +185,10 @@ function mountConsole(root: HTMLElement): void {
     settings: { publicBaseUrl: "", baseUrl: `${window.location.origin}/v1` },
     logs: [],
     logsHaveMore: false,
+    logCursor: "",
+    logNextCursor: "",
+    logCursorHistory: [],
+    logPage: 1,
     usage: null
   };
   const notice = (message: string, error = false): void => {
@@ -191,19 +200,40 @@ function mountConsole(root: HTMLElement): void {
     element.classList.toggle("success", Boolean(message) && !error);
   };
 
-  const refreshLogs = async (): Promise<void> => {
+  const resetLogPaging = (): void => {
+    state.logCursor = "";
+    state.logNextCursor = "";
+    state.logCursorHistory = [];
+    state.logPage = 1;
+  };
+
+  const refreshLogs = async (reset = false): Promise<void> => {
+    if (reset) resetLogPaging();
     const params = new URLSearchParams();
-    params.set("limit", root.querySelector<HTMLSelectElement>("#log-limit")?.value || "100");
+    params.set("limit", root.querySelector<HTMLSelectElement>("#log-limit")?.value || "10");
+    if (state.logCursor) params.set("cursor", state.logCursor);
     const result = root.querySelector<HTMLSelectElement>("#log-result")?.value || "";
     const model = root.querySelector<HTMLInputElement>("#log-model")?.value.trim() || "";
     const path = root.querySelector<HTMLInputElement>("#log-path")?.value.trim() || "";
     if (result) params.set("result", result);
     if (model) params.set("model", model);
     if (path) params.set("path", path);
-    const response = await requestJson<{ data: RequestLogEntry[]; hasMore: boolean }>(`/api/request-logs?${params}`);
+    const response = await requestJson<{ data: RequestLogEntry[]; hasMore: boolean; nextCursor?: string }>(`/api/request-logs?${params}`);
     state.logs = response.data;
     state.logsHaveMore = response.hasMore;
-    renderLogs(root, state.logs, state.logsHaveMore);
+    state.logNextCursor = response.nextCursor || "";
+    renderLogs(root, state, () => {
+      if (state.logPage <= 1) return;
+      state.logCursor = state.logCursorHistory.pop() || "";
+      state.logPage = Math.max(1, state.logPage - 1);
+      void refreshLogs();
+    }, () => {
+      if (!state.logsHaveMore || !state.logNextCursor) return;
+      state.logCursorHistory.push(state.logCursor);
+      state.logCursor = state.logNextCursor;
+      state.logPage += 1;
+      void refreshLogs();
+    });
   };
 
   const refreshUsage = async (): Promise<void> => {
@@ -222,7 +252,7 @@ function mountConsole(root: HTMLElement): void {
       state.clientKeys = keys.data || [];
       state.settings = settings;
       renderCore(root, state, refresh, notice);
-      await Promise.all([refreshLogs(), refreshUsage()]);
+      await Promise.all([refreshLogs(true), refreshUsage()]);
       notice("");
     } catch (error) {
       const message = error instanceof Error ? error.message : "加载失败";
@@ -240,10 +270,17 @@ function mountConsole(root: HTMLElement): void {
   root.querySelector("#import-accounts")?.addEventListener("click", () => accountDialog.showModal());
   root.querySelector("#cancel-account")?.addEventListener("click", () => accountDialog.close());
   root.querySelector("#refresh-all")?.addEventListener("click", () => void refresh());
-  root.querySelector("#refresh-logs")?.addEventListener("click", () => void refreshLogs().catch((error) => notice(error instanceof Error ? error.message : "日志刷新失败", true)));
+  root.querySelector("#refresh-logs")?.addEventListener("click", () => void refreshLogs(true).catch((error) => notice(error instanceof Error ? error.message : "日志刷新失败", true)));
   root.querySelector("#refresh-usage")?.addEventListener("click", () => void refreshUsage().catch((error) => notice(error instanceof Error ? error.message : "用量刷新失败", true)));
-  root.querySelector("#log-result")?.addEventListener("change", () => void refreshLogs());
-  root.querySelector("#log-limit")?.addEventListener("change", () => void refreshLogs());
+  root.querySelector("#log-result")?.addEventListener("change", () => void refreshLogs(true));
+  root.querySelector("#log-limit")?.addEventListener("change", () => void refreshLogs(true));
+  root.querySelector("#log-model")?.addEventListener("change", () => void refreshLogs(true));
+  root.querySelector("#log-path")?.addEventListener("change", () => void refreshLogs(true));
+  ["#log-model", "#log-path"].forEach((selector) => {
+    root.querySelector<HTMLInputElement>(selector)?.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") void refreshLogs(true);
+    });
+  });
   root.querySelector("#logout")?.addEventListener("click", () => {
     void requestJson("/api/auth/logout", { method: "POST" }).finally(() => boot(root));
   });
@@ -274,7 +311,7 @@ function mountConsole(root: HTMLElement): void {
     }).then((confirmed) => {
       if (!confirmed) return;
       return requestJson("/api/request-logs", { method: "DELETE" })
-        .then(() => Promise.all([refreshLogs(), refreshUsage()]))
+        .then(() => Promise.all([refreshLogs(true), refreshUsage()]))
         .then(() => notice("请求日志已清空"));
     }).catch((error) => notice(error instanceof Error ? error.message : "清空失败", true));
   });
@@ -377,7 +414,7 @@ function consoleMarkup(): string {
             <label>结果<select id="log-result"><option value="">全部</option><option value="completed">成功</option><option value="failed">失败</option><option value="canceled">已取消</option></select></label>
             <label>模型<input id="log-model" placeholder="例如 grok-4.6"/></label>
             <label>路径<input id="log-path" placeholder="例如 /responses"/></label>
-            <label>条数<select id="log-limit"><option>50</option><option selected>100</option><option>200</option><option>500</option></select></label>
+            <label>每页<select id="log-limit"><option selected>10</option><option>20</option><option>50</option></select></label>
           </div>
           <div id="request-log-list" class="request-log-list"><div class="empty-state"><span>正在加载请求日志...</span></div></div>
         </section>
@@ -537,16 +574,27 @@ function renderUsage(root: HTMLElement, usage: UsageResponse): void {
     ${officialMarkup}`;
 }
 
-function renderLogs(root: HTMLElement, logs: RequestLogEntry[], hasMore: boolean): void {
+function renderLogs(
+  root: HTMLElement,
+  state: DashboardState,
+  previousPage: () => void,
+  nextPage: () => void
+): void {
   const list = root.querySelector<HTMLElement>("#request-log-list")!;
-  if (!logs.length) {
-    list.innerHTML = `<div class="empty-state"><strong>暂无匹配日志</strong><span>新请求完成后会在这里显示。</span></div>`;
-    return;
+  if (!state.logs.length) {
+    list.innerHTML = `<div class="empty-state"><strong>暂无匹配日志</strong><span>新请求完成后会在这里显示。</span></div>${logPagerMarkup(state)}`;
+  } else {
+    list.innerHTML = `
+      <div class="request-log-head"><span>时间</span><span>接口</span><span>模型 / Cursor 账号</span><span>结果</span><span>耗时</span></div>
+      ${state.logs.map((entry) => `<div class="request-log-row"><time>${escapeHtml(formatDate(entry.timestamp))}</time><div><strong>${escapeHtml(entry.method)}</strong> <code>${escapeHtml(entry.path)}</code>${entry.streaming ? `<small>stream</small>` : ""}</div><div><strong>${escapeHtml(entry.model || "-")}</strong><small>推理级别：${escapeHtml(entry.reasoningEffort || "默认")}</small><small>${escapeHtml(entry.credentialLabel ? `${entry.credentialLabel} · ••••${entry.credentialHint || ""}` : "未解析账号")}</small></div><div><span class="log-result ${entry.result}">${logResultText(entry.result)}</span><small>HTTP ${entry.statusCode}${entry.errorCode ? ` · ${escapeHtml(entry.errorCode)}` : ""}</small></div><div><strong>${formatDuration(entry.durationMs)}</strong><small>${entry.firstByteMs !== undefined ? `首字节 ${formatDuration(entry.firstByteMs)}` : ""}</small></div></div>`).join("")}
+      ${logPagerMarkup(state)}`;
   }
-  list.innerHTML = `
-    <div class="request-log-head"><span>时间</span><span>接口</span><span>模型 / Cursor 账号</span><span>结果</span><span>耗时</span></div>
-    ${logs.map((entry) => `<div class="request-log-row"><time>${escapeHtml(formatDate(entry.timestamp))}</time><div><strong>${escapeHtml(entry.method)}</strong> <code>${escapeHtml(entry.path)}</code>${entry.streaming ? `<small>stream</small>` : ""}</div><div><strong>${escapeHtml(entry.model || "-")}</strong><small>${escapeHtml(entry.credentialLabel ? `${entry.credentialLabel} · ••••${entry.credentialHint || ""}` : "未解析账号")}</small></div><div><span class="log-result ${entry.result}">${logResultText(entry.result)}</span><small>HTTP ${entry.statusCode}${entry.errorCode ? ` · ${escapeHtml(entry.errorCode)}` : ""}</small></div><div><strong>${formatDuration(entry.durationMs)}</strong><small>${entry.firstByteMs !== undefined ? `首字节 ${formatDuration(entry.firstByteMs)}` : ""}</small></div></div>`).join("")}
-    ${hasMore ? `<div class="log-more-note">还有更多匹配记录，请缩小筛选范围或提高条数。</div>` : ""}`;
+  list.querySelector<HTMLButtonElement>("#log-prev")?.addEventListener("click", previousPage);
+  list.querySelector<HTMLButtonElement>("#log-next")?.addEventListener("click", nextPage);
+}
+
+function logPagerMarkup(state: DashboardState): string {
+  return `<div class="log-pagination"><span>第 ${state.logPage} 页 · 当前 ${state.logs.length} 条</span><div><button class="btn btn-compact btn-secondary" id="log-prev" type="button" ${state.logPage <= 1 ? "disabled" : ""}>上一页</button><span class="log-page-number">${state.logPage}</span><button class="btn btn-compact btn-secondary" id="log-next" type="button" ${!state.logsHaveMore || !state.logNextCursor ? "disabled" : ""}>下一页</button></div></div>`;
 }
 
 async function copyInput(input: HTMLInputElement, notice: (message: string, error?: boolean) => void): Promise<void> {
