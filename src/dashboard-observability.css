@@ -428,9 +428,19 @@
   transform: translateX(2px);
 }
 
-.console-nav a:first-child {
+/* The active item is driven by src/main.ts syncDashboardNav (.is-active /
+   aria-current). Do not hardcode :first-child here: it keeps 概览 highlighted
+   no matter which section the user actually opened. */
+.console-nav a.is-active,
+.console-nav a[aria-current="page"] {
   background: rgba(99, 102, 241, 0.18);
   color: #fff;
+}
+
+/* Every anchored section, including the hero, must clear the sticky topbar when
+   scrollIntoView({ block: "start" }) lands on it. */
+.dashboard-main section[id] {
+  scroll-margin-top: 88px;
 }
 
 .console-sidebar-note {

@@ -69,7 +69,11 @@
   letter-spacing: -0.01em;
 }
 
-/* Reset every sidebar item; explicit JS state and :target are the only active sources. */
+/* Reset every sidebar item; the explicit JS state (.is-active / aria-current, set by
+   src/main.ts syncDashboardNav) is the only source of truth for the active section.
+   The earlier :target-based selectors never matched in practice because navigation
+   uses history.pushState, which does not update :target, and the old "no :target"
+   fallback ended up permanently highlighting 概览 whenever the JS state was absent. */
 .console-shell .console-nav a,
 .console-shell .console-nav a:first-child {
   background: transparent !important;
@@ -77,18 +81,22 @@
 }
 
 .console-shell .console-nav a.is-active,
-.console-shell .console-nav a[aria-current="page"],
-.console-shell:has(#overview:target) .console-nav a[href="#overview"],
-.console-shell:has(#connection:target) .console-nav a[href="#connection"],
-.console-shell:has(#credentials:target) .console-nav a[href="#credentials"],
-.console-shell:has(#usage:target) .console-nav a[href="#usage"],
-.console-shell:has(#request-logs:target) .console-nav a[href="#request-logs"],
-.console-shell:has(#client-keys:target) .console-nav a[href="#client-keys"] {
+.console-shell .console-nav a[aria-current="page"] {
   background: rgba(99, 102, 241, 0.18) !important;
   color: #fff !important;
 }
 
-.console-shell:not(:has(#overview:target)):not(:has(#connection:target)):not(:has(#credentials:target)):not(:has(#usage:target)):not(:has(#request-logs:target)):not(:has(#client-keys:target)) .console-nav a[href="#overview"] {
+/* The reset above uses !important, so interactive feedback needs it too; without
+   these rules hover/focus would only move the item 2px with no color change. */
+.console-shell .console-nav a:hover,
+.console-shell .console-nav a:focus-visible {
+  background: rgba(255, 255, 255, 0.08) !important;
+  color: #fff !important;
+}
+
+/* Before the nav state is synced (first paint, JS still loading) default to 概览.
+   As soon as syncDashboardNav marks an item this rule stops matching. */
+.console-shell .console-nav:not(:has(.is-active)):not(:has([aria-current])) a:first-child {
   background: rgba(99, 102, 241, 0.18) !important;
   color: #fff !important;
 }
