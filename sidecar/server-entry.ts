@@ -2,6 +2,7 @@ import http from "node:http";
 import { syncBuiltinESMExports } from "node:module";
 
 import {
+  bindDownstreamAbort,
   installDownstreamAwareFetch,
   runWithDownstreamSignal
 } from "./downstream-abort";
@@ -19,19 +20,14 @@ http.createServer = ((optionsOrListener?: unknown, maybeListener?: unknown) => {
   const wrappedListener = listener
     ? (request: http.IncomingMessage, response: http.ServerResponse) => {
         const controller = new AbortController();
-        const abortDownstream = () => {
-          if (!controller.signal.aborted) {
-            controller.abort(new Error("downstream client disconnected"));
-          }
-          if (!response.writableEnded) {
-            console.info(JSON.stringify({
-              event: "downstream_disconnect",
-              method: request.method || "",
-              path: request.url || ""
-            }));
-          }
-        };
-        response.once("close", abortDownstream);
+        bindDownstreamAbort(request, response, controller, (reason) => {
+          console.info(JSON.stringify({
+            event: "downstream_disconnect",
+            reason,
+            method: request.method || "",
+            path: request.url || ""
+          }));
+        });
         runWithDownstreamSignal(controller.signal, () => listener(request, response));
       }
     : undefined;
