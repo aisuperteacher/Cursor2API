@@ -1,4 +1,4 @@
-import { appendFile, chmod, mkdir, readFile, readdir, rename, stat, unlink } from "node:fs/promises";
+import { appendFile, chmod, mkdir, open, readdir, rename, stat, unlink, type FileHandle } from "node:fs/promises";
 import { join } from "node:path";
 
 export type RequestLogResult = "completed" | "failed" | "canceled";
@@ -103,6 +103,7 @@ interface RequestLogCursor {
 }
 
 const CURRENT_FILE = "requests.jsonl";
+const REVERSE_READ_CHUNK_BYTES = 256 * 1024;
 const LOG_FILE_PATTERN = /^requests(?:-\d+-\d+)?\.jsonl$/;
 const DEFAULT_QUERY_LIMIT = 10;
 const MAX_QUERY_LIMIT = 50;
@@ -183,32 +184,33 @@ export class RequestLogStore {
     let afterCursor = !cursor;
     const files = (await this.logFiles()).sort((left, right) => right.mtimeMs - left.mtimeMs);
 
+    let overflow = false;
     for (const file of files) {
-      const text = await readFile(file.path, "utf8").catch(() => "");
-      const lines = text.split(/\r?\n/);
-      for (let index = lines.length - 1; index >= 0; index -= 1) {
-        const entry = parseEntry(lines[index]);
-        if (!entry || !matchesQuery(entry, query)) continue;
+      await forEachLineReverse(file.path, (line) => {
+        const entry = parseEntry(line);
+        if (!entry || !matchesQuery(entry, query)) return false;
 
         if (!afterCursor && cursor) {
           if (entry.id === cursor.id && entry.timestamp === cursor.timestamp) {
             afterCursor = true;
-            continue;
+            return false;
           }
           const entryTimestamp = Date.parse(entry.timestamp);
           if (Number.isFinite(cursorTimestamp) && Number.isFinite(entryTimestamp) && entryTimestamp < cursorTimestamp) {
             afterCursor = true;
           } else {
-            continue;
+            return false;
           }
         }
 
         if (data.length < limit) {
           data.push(entry);
-          continue;
+          return false;
         }
-        return pageResult(data, true);
-      }
+        overflow = true;
+        return true;
+      });
+      if (overflow) return pageResult(data, true);
     }
     return pageResult(data, false);
   }
@@ -222,17 +224,16 @@ export class RequestLogStore {
     const files = (await this.logFiles()).sort((left, right) => right.mtimeMs - left.mtimeMs);
 
     for (const file of files) {
-      const text = await readFile(file.path, "utf8").catch(() => "");
-      const lines = text.split(/\r?\n/);
-      for (let index = lines.length - 1; index >= 0; index -= 1) {
-        const entry = parseEntry(lines[index]);
-        if (!entry) continue;
+      await forEachLineReverse(file.path, (line) => {
+        const entry = parseEntry(line);
+        if (!entry) return false;
         if (entries.length >= USAGE_SAMPLE_LIMIT) {
           sampled = true;
-          break;
+          return true;
         }
         entries.push(entry);
-      }
+        return false;
+      });
       if (sampled) break;
     }
 
@@ -427,6 +428,64 @@ function sanitizeEntry(entry: RequestLogEntry): RequestLogEntry {
     ...(entry.firstByteMs !== undefined ? { firstByteMs: nonNegativeInteger(entry.firstByteMs) } : {}),
     ...(entry.errorCode ? { errorCode: stringValue(entry.errorCode, 120) } : {})
   };
+}
+
+/**
+ * Visit the lines of a jsonl file from last to first without loading the whole
+ * file: 256KB chunks are read backwards and reassembled on newline boundaries
+ * (byte-level \n scanning is UTF-8 safe, so multi-byte content never splits).
+ * Returning true from `visit` stops the scan early.
+ */
+async function forEachLineReverse(path: string, visit: (line: string) => boolean): Promise<void> {
+  let handle: FileHandle;
+  try {
+    handle = await open(path, "r");
+  } catch {
+    return;
+  }
+  try {
+    const stats = await handle.stat();
+    if (stats.size <= 0) return;
+    const chunk = Buffer.allocUnsafe(Math.min(REVERSE_READ_CHUNK_BYTES, stats.size));
+    let offset = stats.size;
+    let leftover: Buffer = Buffer.alloc(0);
+    while (offset > 0) {
+      const start = Math.max(0, offset - chunk.length);
+      const { bytesRead } = await handle.read(chunk, 0, offset - start, start);
+      if (bytesRead <= 0) break;
+      offset = start;
+      const data = leftover.length
+        ? Buffer.concat([chunk.subarray(0, bytesRead), leftover])
+        : chunk.subarray(0, bytesRead);
+      const lastNewline = data.lastIndexOf(10);
+      if (lastNewline === -1) {
+        leftover = Buffer.from(data);
+        continue;
+      }
+      // The tail after the last newline completes the line whose head was the
+      // leftover from the previous (later) chunk.
+      const tail = data.subarray(lastNewline + 1);
+      if (tail.length && visit(lineFromBytes(tail))) return;
+      let end = lastNewline;
+      for (;;) {
+        const newline = data.lastIndexOf(10, end - 1);
+        if (newline === -1) break;
+        const segment = data.subarray(newline + 1, end);
+        if (segment.length && visit(lineFromBytes(segment))) return;
+        end = newline;
+      }
+      leftover = Buffer.from(data.subarray(0, end));
+    }
+    if (leftover.length) visit(lineFromBytes(leftover));
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+function lineFromBytes(bytes: Buffer): string {
+  let end = bytes.length;
+  if (end > 0 && bytes[end - 1] === 13) end -= 1;
+  return bytes.toString("utf8", 0, end);
 }
 
 function parseEntry(line: string): RequestLogEntry | null {

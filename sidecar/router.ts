@@ -1,6 +1,40 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmdirSync, statSync } from "node:fs";
 import { writePrivateJsonAtomic } from "./secure-state";
+
+const STATE_LOCK_TIMEOUT_MS = 3_000;
+const STATE_LOCK_STALE_MS = 10_000;
+
+/** Cross-process advisory lock built on mkdir (atomic on POSIX and Windows). */
+function acquireStateLockSync(lockPath: string): void {
+  const deadline = Date.now() + STATE_LOCK_TIMEOUT_MS;
+  for (;;) {
+    try {
+      mkdirSync(lockPath);
+      return;
+    } catch {
+      try {
+        const stats = statSync(lockPath);
+        if (Date.now() - stats.mtimeMs > STATE_LOCK_STALE_MS) {
+          try { rmdirSync(lockPath); } catch { /* raced; retry below */ }
+          continue;
+        }
+      } catch {
+        continue; // lock vanished between attempts
+      }
+      if (Date.now() >= deadline) {
+        throw new CursorRouterStateError(`Cursor router state lock at ${lockPath} is busy`);
+      }
+      // Blocking 20ms sleep that works on the main thread (no async gap, so the
+      // synchronous mutation API stays synchronous).
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+    }
+  }
+}
+
+function releaseStateLockSync(lockPath: string): void {
+  try { rmdirSync(lockPath); } catch { /* already released */ }
+}
 
 export interface PoolCatalogModel {
   id: string;
@@ -173,65 +207,141 @@ export class CursorCredentialPool {
   }
 
   disableModel(credential: PoolCredential, model: string): void {
-    credential.disabledModels.add(canonicalModelId(model));
-    this.persist();
+    this.mutate(() => {
+      const target = this.credentials.find((item) => item.id === credential.id) || credential;
+      target.disabledModels.add(canonicalModelId(model));
+      this.persist();
+    });
   }
 
   addCredential(apiKey: string, label = "Imported"): PoolCredential {
-    const normalized = apiKey.trim();
-    const existing = this.credentials.find((credential) => credential.apiKey === normalized);
-    if (existing) {
-      existing.label = label.trim() || existing.label;
-      existing.status = "active";
-      existing.disabledReason = undefined;
-      existing.managed = true;
+    return this.mutate(() => {
+      const normalized = apiKey.trim();
+      const existing = this.credentials.find((credential) => credential.apiKey === normalized);
+      if (existing) {
+        existing.label = label.trim() || existing.label;
+        existing.status = "active";
+        existing.disabledReason = undefined;
+        existing.managed = true;
+        this.persist();
+        return existing;
+      }
+      const credential: PoolCredential = {
+        id: credentialId(normalized),
+        label: label.trim() || `cursor-${this.credentials.length + 1}`,
+        apiKey: normalized,
+        hint: normalized.slice(-4),
+        disabledModels: new Set(),
+        status: "active",
+        managed: true,
+        environment: false
+      };
+      this.credentials.push(credential);
       this.persist();
-      return existing;
-    }
-    const credential: PoolCredential = {
-      id: credentialId(normalized),
-      label: label.trim() || `cursor-${this.credentials.length + 1}`,
-      apiKey: normalized,
-      hint: normalized.slice(-4),
-      disabledModels: new Set(),
-      status: "active",
-      managed: true,
-      environment: false
-    };
-    this.credentials.push(credential);
-    this.persist();
-    return credential;
+      return credential;
+    });
   }
 
   disableCredential(id: string, reason = "disabled by gateway owner"): boolean {
-    const credential = this.credentials.find((item) => item.id === id);
-    if (!credential) return false;
-    credential.status = "disabled";
-    credential.disabledReason = reason;
-    this.persist();
-    return true;
+    return this.mutate(() => {
+      const credential = this.credentials.find((item) => item.id === id);
+      if (!credential) return false;
+      credential.status = "disabled";
+      credential.disabledReason = reason;
+      this.persist();
+      return true;
+    });
   }
 
   enableCredential(id: string): boolean {
-    const credential = this.credentials.find((item) => item.id === id);
-    if (!credential) return false;
-    credential.status = "active";
-    credential.disabledReason = undefined;
-    this.persist();
-    return true;
+    return this.mutate(() => {
+      const credential = this.credentials.find((item) => item.id === id);
+      if (!credential) return false;
+      credential.status = "active";
+      credential.disabledReason = undefined;
+      this.persist();
+      return true;
+    });
   }
 
   deleteCredential(id: string): DeleteCredentialResult {
-    const index = this.credentials.findIndex((item) => item.id === id);
-    if (index < 0) return "not_found";
-    if (this.credentials[index].environment || !this.credentials[index].managed) return "unmanaged";
-    this.credentials.splice(index, 1);
-    this.persist();
-    return "deleted";
+    return this.mutate(() => {
+      const index = this.credentials.findIndex((item) => item.id === id);
+      if (index < 0) return "not_found";
+      if (this.credentials[index].environment || !this.credentials[index].managed) return "unmanaged";
+      this.credentials.splice(index, 1);
+      this.persist();
+      return "deleted";
+    });
   }
 
   credentialForApiKey(apiKey: string): PoolCredential | undefined {
     return this.credentials.find((credential) => credential.apiKey === apiKey);
+  }
+
+  /**
+   * Run a mutation under the cross-process state lock. Before applying it, the
+   * managed-credential view is reloaded from disk so a mutation made by another
+   * process is never silently overwritten by this instance's stale snapshot.
+   */
+  private mutate<T>(apply: () => T): T {
+    if (!this.statePath) return apply();
+    const lockPath = `${this.statePath}.lock`;
+    acquireStateLockSync(lockPath);
+    try {
+      this.reloadManagedFromDisk();
+      return apply();
+    } finally {
+      releaseStateLockSync(lockPath);
+    }
+  }
+
+  private reloadManagedFromDisk(): void {
+    if (!this.statePath || !this.encryptionKey) return;
+    let state: RouterState;
+    try {
+      state = readRouterState(this.statePath);
+    } catch {
+      return; // unreadable/corrupt on-disk state: keep the in-memory view
+    }
+
+    const diskManaged = new Map<string, PoolCredential>();
+    for (const item of state.credentials) {
+      try {
+        const apiKey = decryptValue(item.secret, this.encryptionKey);
+        diskManaged.set(item.id, {
+          id: item.id,
+          label: item.label,
+          apiKey,
+          hint: apiKey.slice(-4),
+          disabledModels: new Set((state.disabledModels[item.id] || []).map(canonicalModelId)),
+          status: state.disabledCredentials[item.id] ? "disabled" : "active",
+          disabledReason: state.disabledCredentials[item.id],
+          managed: true,
+          environment: false
+        });
+      } catch {
+        // undecryptable entry: leave the in-memory view untouched for it
+      }
+    }
+
+    for (let index = this.credentials.length - 1; index >= 0; index -= 1) {
+      const credential = this.credentials[index];
+      if (credential.managed && !diskManaged.has(credential.id)) this.credentials.splice(index, 1);
+    }
+    for (const [id, fresh] of diskManaged) {
+      const existing = this.credentials.find((credential) => credential.id === id);
+      if (existing) {
+        existing.apiKey = fresh.apiKey;
+        existing.hint = fresh.hint;
+        existing.label = fresh.label;
+        existing.status = fresh.status;
+        existing.disabledReason = fresh.disabledReason;
+        existing.disabledModels = fresh.disabledModels;
+      } else {
+        this.credentials.push(fresh);
+      }
+    }
   }
 
   private persist(): void {
@@ -419,7 +529,7 @@ function isStoredCredential(value: unknown): value is RouterState["credentials"]
   return [value.secret.ciphertext, value.secret.iv, value.secret.tag].every((field) => typeof field === "string");
 }
 
-function encryptValue(value: string, key: Buffer): EncryptedValue {
+export function encryptValue(value: string, key: Buffer): EncryptedValue {
   const iv = randomBytes(12);
   const cipher = createCipheriv("aes-256-gcm", key, iv);
   const ciphertext = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]);
