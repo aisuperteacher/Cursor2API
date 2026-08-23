@@ -1,5 +1,6 @@
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
+import { DEFAULT_RATE_LIMIT, normalizeRateLimitConfig, type RateLimitConfig } from "./gateway-limiter";
 import { writePrivateJsonAtomic } from "./secure-state";
 
 interface ClientKeyRecord {
@@ -16,6 +17,7 @@ interface AuthState {
   sessionSecret: string;
   clientKeys: ClientKeyRecord[];
   publicBaseUrl?: string;
+  rateLimit?: RateLimitConfig;
 }
 
 interface SharedAuthState {
@@ -162,6 +164,17 @@ export class LocalAuthStore {
     return normalized;
   }
 
+  rateLimit(): RateLimitConfig {
+    return this.shared.state.rateLimit || DEFAULT_RATE_LIMIT;
+  }
+
+  setRateLimit(value: unknown): RateLimitConfig {
+    const normalized = normalizeRateLimitConfig(value);
+    this.shared.state.rateLimit = normalized;
+    this.persist();
+    return normalized;
+  }
+
   private persist(): void {
     try {
       writePrivateJsonAtomic(this.statePath, this.shared.state);
@@ -216,7 +229,10 @@ function readState(path: string): AuthState {
     adminPasswordHash: parsed.adminPasswordHash as string | undefined,
     sessionSecret: parsed.sessionSecret,
     clientKeys,
-    publicBaseUrl: parsed.publicBaseUrl as string | undefined
+    publicBaseUrl: parsed.publicBaseUrl as string | undefined,
+    // Unknown/corrupt values normalize back to the defaults rather than throwing:
+    // a bad limiter config must never lock the owner out of the console.
+    rateLimit: parsed.rateLimit === undefined ? undefined : normalizeRateLimitConfig(parsed.rateLimit)
   };
 }
 

@@ -256,7 +256,7 @@ async function main() {
 
   await cdp.send("Page.navigate", { url: `${baseUrl}/dashboard` });
   await waitFor("the dashboard sidebar", () => cdp.evaluate(
-    `document.querySelectorAll('.console-nav a[href^="#"]').length === 6`
+    `document.querySelectorAll('.console-nav a[href^="#"]').length === 7`
   ));
 
   await waitFor("the default overview active state", async () => {
@@ -269,7 +269,7 @@ async function main() {
     }
   });
 
-  for (const hash of ["#connection", "#credentials", "#usage", "#request-logs", "#client-keys", "#overview"]) {
+  for (const hash of ["#connection", "#credentials", "#usage", "#request-logs", "#client-keys", "#rate-limit", "#overview"]) {
     await cdp.evaluate(`document.querySelector('.console-nav a[href=${JSON.stringify(hash)}]').click()`);
     await waitFor(`${hash} to become the only active sidebar item`, async () => {
       const snapshot = await navSnapshot();

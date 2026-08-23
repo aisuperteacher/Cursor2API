@@ -83,6 +83,7 @@ import {
 import { AsyncStaleCache } from "./async-stale-cache";
 import { AnthropicSessionLinkStore, preferCredential, type AnthropicContinuation } from "./anthropic-session";
 import { LocalAuthStore, sessionCookie, sessionToken } from "./auth";
+import { GatewayRateLimiter, type RateLimitConfig } from "./gateway-limiter";
 import { LoginAttemptLimiter } from "./login-limiter";
 import { bindDownstreamAbort, runWithDownstreamSignal } from "./downstream-abort";
 import { writeWebResponse } from "./node-response";
@@ -145,6 +146,8 @@ const loginLimiter = new LoginAttemptLimiter(
   Number.parseInt(process.env.ADMIN_LOGIN_LOCKOUT_MS || "900000", 10) || 900_000
 );
 const anthropicSessionLinks = new AnthropicSessionLinkStore();
+// Reads the persisted config on every request so console edits apply immediately.
+const gatewayLimiter = new GatewayRateLimiter(() => authStore.rateLimit());
 
 /**
  * The SDK bridge path (full macOS parity) is the PRIMARY route for
@@ -515,6 +518,17 @@ function loginIdentity(request: Request): string {
   return request.headers.get("x-cursor2api-remote-address") || "unknown";
 }
 
+/** 429 for owner-configured throttling, with the standard Retry-After hint. */
+function rateLimited(retryAfterSeconds: number, reason?: "ip_failures" | "key_quota"): Response {
+  const message = reason === "key_quota"
+    ? "This API key exceeded the configured request rate"
+    : "Too many unauthorized requests from this address";
+  return json(
+    { error: { message, type: "rate_limit_error", code: "rate_limit_exceeded" } },
+    { status: 429, headers: { "retry-after": String(retryAfterSeconds) } }
+  );
+}
+
 function publicApiBaseUrl(request: Request): string {
   const configured = configuredPublicBaseUrl();
   return (configured || new URL(request.url).origin) + "/v1";
@@ -594,12 +608,33 @@ function handleAuthLogout(request: Request): Response {
 
 async function handleSettings(request: Request): Promise<Response> {
   if (!hasAdminSession(request)) return unauthorized();
-  if (request.method === "GET") return json({ publicBaseUrl: configuredPublicBaseUrl(), baseUrl: publicApiBaseUrl(request) });
+  const snapshot = (): Record<string, unknown> => ({
+    publicBaseUrl: configuredPublicBaseUrl(),
+    baseUrl: publicApiBaseUrl(request),
+    rateLimit: authStore.rateLimit()
+  });
+  if (request.method === "GET") return json(snapshot());
   if (request.method === "PUT") {
     const body = await readJsonObject(request);
-    const value = typeof body.publicBaseUrl === "string" ? body.publicBaseUrl : "";
-    const publicBaseUrl = authStore.setPublicBaseUrl(normalizePublicBaseUrl(value));
-    return json({ publicBaseUrl, baseUrl: publicApiBaseUrl(request) });
+    // Only touch fields the caller actually sent: the console saves the endpoint
+    // and the limiter form independently.
+    if (typeof body.publicBaseUrl === "string") {
+      authStore.setPublicBaseUrl(normalizePublicBaseUrl(body.publicBaseUrl));
+    }
+    if (body.rateLimit !== undefined) {
+      const previous = authStore.rateLimit();
+      const next = authStore.setRateLimit(body.rateLimit);
+      // Raising or disabling a limit should take effect at once, not after the
+      // current window drains.
+      if (!next.enabled
+        || next.windowSeconds !== previous.windowSeconds
+        || next.maxFailuresPerIp > previous.maxFailuresPerIp
+        || next.maxRequestsPerKey > previous.maxRequestsPerKey
+        || next.blockSeconds < previous.blockSeconds) {
+        gatewayLimiter.reset();
+      }
+    }
+    return json(snapshot());
   }
   return notFound();
 }
@@ -1310,6 +1345,18 @@ async function route(request: Request, port: number): Promise<Response> {
     }
 
     const v1Path = pathname.startsWith("/v1/") ? pathname.slice(3) : pathname === "/v1" ? "/" : "";
+
+    if (v1Path) {
+      // Owner-configured throttling for the public surface. Handlers keep doing
+      // their own auth check; this only accounts for traffic and rejects abuse.
+      const apiKey = requestApiKey(request);
+      const decision = gatewayLimiter.evaluate({
+        identity: loginIdentity(request),
+        apiKey,
+        authorized: Boolean(authStore.clientKey(apiKey))
+      });
+      if (decision.retryAfterSeconds > 0) return rateLimited(decision.retryAfterSeconds, decision.reason);
+    }
 
     if (v1Path === "/models") {
       if (request.method !== "GET") return notFound();
