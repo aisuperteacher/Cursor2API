@@ -1053,9 +1053,6 @@ pre {
   html { scroll-behavior: auto; }
 }
 
-/* ---------- Legacy chat fallback ---------- */
-/* Chat page styles live in src/chat.css (imported by src/chat.ts). */
-
 /* ---------- Responsive ---------- */
 @media (max-width: 900px) {
   .features {
