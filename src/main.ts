@@ -1,6 +1,9 @@
 import { hydrateIcons, wireCopyButtons } from "./ui";
 
-const isChatRoute = (): boolean => window.location.pathname.replace(/\/+$/, "") === "/chat";
+const isPlaygroundRoute = (): boolean => {
+  const path = window.location.pathname.replace(/\/+$/, "");
+  return path === "/playground" || path === "/chat";
+};
 const isDashboardRoute = (): boolean => window.location.pathname.replace(/\/+$/, "") === "/dashboard";
 const dashboardHashes = new Set(["#overview", "#connection", "#credentials", "#usage", "#request-logs", "#client-keys"]);
 let dashboardNavObserver: MutationObserver | null = null;
@@ -100,12 +103,12 @@ async function route(): Promise<void> {
     return;
   }
 
-  if (isChatRoute()) {
+  if (isPlaygroundRoute()) {
     landing.hidden = true;
     chatRoot.hidden = false;
-    document.title = "Cursor Chat - API for Cursor";
-    const { mountChat } = await import("./chat");
-    mountChat(chatRoot);
+    document.title = "API Playground - API for Cursor";
+    const { mountPlayground } = await import("./playground");
+    mountPlayground(chatRoot);
     return;
   }
 
@@ -129,7 +132,7 @@ document.addEventListener("click", (event) => {
     return;
   }
 
-  if (href !== "/" && href !== "/chat" && href !== "/dashboard") return;
+  if (href !== "/" && href !== "/playground" && href !== "/chat" && href !== "/dashboard") return;
   if (anchor.target === "_blank") return;
   event.preventDefault();
   if (window.location.pathname !== href) {
