@@ -1,5 +1,6 @@
 import { escapeAttr, escapeHtml, highlightJson, icon } from "./ui";
 import { assistantDisplayContent, sanitizeAssistantContent } from "./chat-sanitize";
+import { deleteChatImages, loadChatImages, storeChatImages } from "./chat-image-store";
 import { renderMarkdown } from "./markdown";
 
 /* ============================================================ types */
@@ -21,6 +22,8 @@ interface ChatImage {
   width: number;
   height: number;
   size: number;
+  /** Persisted payload lives in IndexedDB; the localStorage copy only carries this marker. */
+  stored?: boolean;
 }
 
 interface Session {
@@ -109,12 +112,77 @@ function defaultInspectorOpen(): boolean {
   return !window.matchMedia(MOBILE_INSPECTOR_QUERY).matches;
 }
 
+/**
+ * Session text stays in localStorage; image base64 payloads are written to
+ * IndexedDB and only metadata + a `stored` marker is kept here. That keeps the
+ * serialized state a few KB per message no matter how many images are attached,
+ * so quota exhaustion can no longer silently drop history.
+ */
 function saveState(): void {
-  try {
-    localStorage.setItem(STATE_KEY, JSON.stringify(state));
-  } catch {
-    /* storage unavailable - keep running from memory */
+  const images: Array<{ id: string; dataUrl: string }> = [];
+  for (const session of state.sessions) {
+    for (const message of session.messages) {
+      for (const image of message.images ?? []) {
+        if (image.dataUrl.startsWith("data:image/")) images.push({ id: image.id, dataUrl: image.dataUrl });
+      }
+    }
   }
+  void storeChatImages(images).catch(() => undefined);
+
+  const serialized: PersistedState = {
+    ...state,
+    sessions: state.sessions.map((session) => ({
+      ...session,
+      messages: session.messages.map((message) => ({
+        ...message,
+        ...(message.images?.length
+          ? { images: message.images.map((image) => ({ ...image, dataUrl: "", stored: true })) }
+          : {})
+      }))
+    }))
+  };
+  try {
+    localStorage.setItem(STATE_KEY, JSON.stringify(serialized));
+  } catch {
+    try {
+      // Quota from text alone (extremely rare): drop attachments from the
+      // persisted copy rather than losing every session.
+      localStorage.setItem(STATE_KEY, JSON.stringify({
+        ...serialized,
+        sessions: serialized.sessions.map((session) => ({ ...session, messages: session.messages.map(({ images: _images, ...rest }) => rest) }))
+      }));
+    } catch {
+      /* storage unavailable - keep running from memory */
+    }
+  }
+}
+
+/** Re-attach image payloads from IndexedDB after a page load. */
+async function hydrateStoredImages(): Promise<boolean> {
+  const missing: string[] = [];
+  for (const session of state.sessions) {
+    for (const message of session.messages) {
+      for (const image of message.images ?? []) {
+        if (image.stored && !image.dataUrl) missing.push(image.id);
+      }
+    }
+  }
+  if (!missing.length) return false;
+  const payloads = await loadChatImages(missing);
+  let changed = false;
+  for (const session of state.sessions) {
+    for (const message of session.messages) {
+      for (const image of message.images ?? []) {
+        const dataUrl = payloads.get(image.id);
+        if (dataUrl) {
+          image.dataUrl = dataUrl;
+          image.stored = false;
+          changed = true;
+        }
+      }
+    }
+  }
+  return changed;
 }
 
 function uid(prefix: string): string {
@@ -138,6 +206,13 @@ export function mountChat(root: HTMLElement): void {
   cacheRefs(root);
   bindEvents();
   bindResponsiveInspector();
+  // Image payloads load asynchronously from IndexedDB; re-render once they land.
+  void hydrateStoredImages().then((changed) => {
+    if (changed) {
+      renderTranscript();
+      renderInspector();
+    }
+  }).catch(() => undefined);
 
   const remembered = (() => {
     try {
@@ -533,8 +608,10 @@ function deleteSession(id: string): void {
   const session = state.sessions.find((s) => s.id === id);
   if (!session) return;
   if (!window.confirm(`Delete "${session.title}"?`)) return;
+  const orphaned = (session.messages.flatMap((message) => message.images ?? [])).map((image) => image.id);
   state.sessions = state.sessions.filter((s) => s.id !== id);
   if (state.activeId === id) state.activeId = null;
+  void deleteChatImages(orphaned).catch(() => undefined);
   saveState();
   renderSessions();
   renderTranscript();
@@ -587,10 +664,13 @@ function renderUserContent(content: string, images: ChatImage[]): string {
 function userImageHtml(image: ChatImage): string {
   const src = image.dataUrl.startsWith("data:image/") ? image.dataUrl : "";
   const style = imagePreviewStyle(image, CHAT_IMAGE_MAX_WIDTH, CHAT_IMAGE_MAX_HEIGHT);
+  const media = src
+    ? `<img src="${escapeAttr(src)}" alt="${escapeAttr(image.name || "Attached image")}" />`
+    : `<span class="chat-image-missing">${escapeHtml(image.stored ? "Image not loaded" : "Image unavailable")}</span>`;
   return `
     <figure class="chat-image" style="${style}">
       <span class="chat-image-frame">
-        <img src="${escapeAttr(src)}" alt="${escapeAttr(image.name || "Attached image")}" />
+        ${media}
       </span>
       <figcaption>${escapeHtml(image.name || "Image")} · ${image.width}×${image.height}</figcaption>
     </figure>`;
@@ -629,6 +709,7 @@ function chatMessageForApi(message: ChatMessage): Record<string, unknown> {
   const content: Array<Record<string, unknown>> = [];
   if (message.content) content.push({ type: "text", text: message.content });
   for (const image of images) {
+    if (!image.dataUrl.startsWith("data:image/")) continue; // payload missing (not hydrated)
     content.push({
       type: "image_url",
       image_url: {
@@ -648,6 +729,7 @@ function responseMessageForApi(message: ChatMessage): Record<string, unknown> {
   const content: Array<Record<string, unknown>> = [];
   if (message.content) content.push({ type: "input_text", text: message.content });
   for (const image of images) {
+    if (!image.dataUrl.startsWith("data:image/")) continue; // payload missing (not hydrated)
     content.push({
       type: "input_image",
       image_url: {
@@ -715,7 +797,7 @@ function sanitizeImages(images: unknown): ChatImage[] {
         typeof item.id === "string" &&
         typeof item.name === "string" &&
         typeof item.dataUrl === "string" &&
-        item.dataUrl.startsWith("data:image/") &&
+        (item.dataUrl.startsWith("data:image/") || (item.dataUrl === "" && item.stored === true)) &&
         typeof item.mimeType === "string" &&
         typeof item.width === "number" &&
         typeof item.height === "number" &&
