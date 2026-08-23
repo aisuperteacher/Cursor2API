@@ -134,8 +134,8 @@ Sidecar 负责三种协议的入站解析与出站整形；SDK Bridge 用官方 
 ### 本地部署（推荐）
 
 ```bash
-git clone https://github.com/NGLSG/cursor2api.git
-cd cursor2api
+git clone https://github.com/aisuperteacher/Cursor2API.git
+cd Cursor2API
 npm ci   # 或 bun install
 
 # 启动 Sidecar + SDK Bridge（前台，持续输出日志）
@@ -259,18 +259,19 @@ docker compose down
 
 ```bash
 mkdir -p cursor2api && cd cursor2api
-curl -fsSLo docker-compose.yml https://raw.githubusercontent.com/NGLSG/Cursor2API/master/docker-compose.dockerhub.yml
-curl -fsSLo .env https://raw.githubusercontent.com/NGLSG/Cursor2API/master/.env.docker.example
+curl -fsSLo docker-compose.yml https://raw.githubusercontent.com/aisuperteacher/Cursor2API/master/docker-compose.dockerhub.yml
+curl -fsSLo .env https://raw.githubusercontent.com/aisuperteacher/Cursor2API/master/.env.docker.example
 # 编辑 .env：至少设置 ADMIN_PASSWORD、CURSOR_SDK_BRIDGE_TOKEN、ENCRYPTION_KEY
 docker compose pull
 docker compose up -d
 docker compose ps
 ```
 
-默认使用 `docker.io/nglsg/cursor2api-api:latest` 和
-`docker.io/nglsg/cursor2api-bridge:latest`。如果你发布到自己的 Docker Hub
-命名空间，在 `.env` 中修改 `CURSOR2API_IMAGE_NAMESPACE`；指定版本时设置
-`CURSOR2API_IMAGE_TAG`，例如 `v0.2.0`。控制台地址为
+默认使用本仓库 CI 发布的 GHCR 镜像 `ghcr.io/aisuperteacher/cursor2api-api:latest`
+和 `ghcr.io/aisuperteacher/cursor2api-bridge:latest`（公开包，拉取无需登录，每次推送
+master 自动更新）。要换成别的来源，在 `.env` 中修改 `CURSOR2API_IMAGE_REGISTRY` 与
+`CURSOR2API_IMAGE_NAMESPACE`；要固定到某个提交，把 `CURSOR2API_IMAGE_TAG` 设为
+`sha-<短提交号>`（例如 `sha-4e782d3`）。控制台地址为
 `http://服务器地址:6718/dashboard`，日志和停止命令分别是：
 
 ```bash

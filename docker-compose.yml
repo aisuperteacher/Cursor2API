@@ -2,7 +2,7 @@ name: cursor2api
 
 services:
   bridge:
-    image: ${CURSOR2API_BRIDGE_IMAGE:-docker.io/${CURSOR2API_IMAGE_NAMESPACE:-nglsg}/cursor2api-bridge:${CURSOR2API_IMAGE_TAG:-latest}}
+    image: ${CURSOR2API_BRIDGE_IMAGE:-${CURSOR2API_IMAGE_REGISTRY:-ghcr.io}/${CURSOR2API_IMAGE_NAMESPACE:-aisuperteacher}/cursor2api-bridge:${CURSOR2API_IMAGE_TAG:-latest}}
     build:
       context: .
       dockerfile: containers/cursor-sdk-bridge/Dockerfile
@@ -23,7 +23,7 @@ services:
     restart: unless-stopped
 
   api:
-    image: ${CURSOR2API_API_IMAGE:-docker.io/${CURSOR2API_IMAGE_NAMESPACE:-nglsg}/cursor2api-api:${CURSOR2API_IMAGE_TAG:-latest}}
+    image: ${CURSOR2API_API_IMAGE:-${CURSOR2API_IMAGE_REGISTRY:-ghcr.io}/${CURSOR2API_IMAGE_NAMESPACE:-aisuperteacher}/cursor2api-api:${CURSOR2API_IMAGE_TAG:-latest}}
     build:
       context: .
       dockerfile: containers/sidecar/Dockerfile
