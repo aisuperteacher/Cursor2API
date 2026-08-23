@@ -5,7 +5,7 @@ const isPlaygroundRoute = (): boolean => {
   return path === "/playground" || path === "/chat";
 };
 const isDashboardRoute = (): boolean => window.location.pathname.replace(/\/+$/, "") === "/dashboard";
-const dashboardHashes = new Set(["#overview", "#connection", "#credentials", "#usage", "#request-logs", "#client-keys"]);
+const dashboardHashes = new Set(["#overview", "#connection", "#credentials", "#usage", "#request-logs", "#client-keys", "#rate-limit"]);
 let dashboardNavObserver: MutationObserver | null = null;
 // Every console-nav element that already received an explicit active state. The
 // console can be re-mounted (sign-in -> sign-in, 401 -> re-auth), which creates a

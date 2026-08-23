@@ -34,9 +34,18 @@ interface ClientKey {
   createdAt: string;
 }
 
+interface RateLimitConfig {
+  enabled: boolean;
+  windowSeconds: number;
+  maxFailuresPerIp: number;
+  maxRequestsPerKey: number;
+  blockSeconds: number;
+}
+
 interface Settings {
   publicBaseUrl: string;
   baseUrl: string;
+  rateLimit?: RateLimitConfig;
 }
 
 interface RequestLogEntry {
@@ -329,6 +338,26 @@ function mountConsole(root: HTMLElement): void {
     }).catch((error) => notice(error instanceof Error ? error.message : "保存失败", true));
   });
 
+  root.querySelector("#rate-limit-enabled")?.addEventListener("change", (event) => {
+    updateRateLimitDisabledState(root, (event.target as HTMLInputElement).checked);
+  });
+
+  root.querySelector("#save-rate-limit")?.addEventListener("click", () => {
+    const button = root.querySelector<HTMLButtonElement>("#save-rate-limit");
+    if (button) button.disabled = true;
+    void requestJson<Settings>("/api/settings", {
+      method: "PUT",
+      body: JSON.stringify({ rateLimit: readRateLimitForm(root) })
+    }).then((value) => {
+      state.settings = value;
+      // The server clamps out-of-range values; re-render so the form shows what
+      // is actually in force rather than what was typed.
+      renderRateLimit(root, value.rateLimit);
+      notice(value.rateLimit?.enabled ? "限流规则已启用" : "限流已关闭");
+    }).catch((error) => notice(error instanceof Error ? error.message : "保存失败", true))
+      .finally(() => { if (button) button.disabled = false; });
+  });
+
   root.querySelectorAll<HTMLElement>("[data-copy-target]").forEach((button) => {
     button.addEventListener("click", () => {
       const input = root.querySelector<HTMLInputElement>(`#${button.dataset.copyTarget || ""}`);
@@ -417,6 +446,7 @@ function consoleMarkup(): string {
           <a href="#usage" aria-label="用量与额度" title="用量与额度">${icon("Zap", { width: 17, height: 17 })}<span>用量与额度</span></a>
           <a href="#request-logs" aria-label="请求日志" title="请求日志">${icon("Terminal", { width: 17, height: 17 })}<span>请求日志</span></a>
           <a href="#client-keys" aria-label="客户端 Keys" title="客户端 Keys">${icon("KeyRound", { width: 17, height: 17 })}<span>客户端 Keys</span></a>
+          <a href="#rate-limit" aria-label="限流与防护" title="限流与防护">${icon("ShieldCheck", { width: 17, height: 17 })}<span>限流与防护</span></a>
         </nav>
         <div class="console-sidebar-note">
           <span class="console-status-dot"></span>
@@ -512,6 +542,27 @@ function consoleMarkup(): string {
               <div id="client-key-list"></div>
             </div>
           </section>
+
+          <section id="rate-limit" class="dashboard-section console-card rate-limit-section">
+            <div class="section-bar">
+              <div class="section-title"><span class="section-icon success">${icon("ShieldCheck", { width: 18, height: 18 })}</span><div><h2>限流与防护</h2><p class="section-note">按你的实际流量自定义 <code>/v1</code> 的限流规则；关闭时网关不做任何节流。</p></div></div>
+              <span class="section-badge" id="rate-limit-state">已关闭</span>
+            </div>
+            <label class="rate-limit-toggle">
+              <input id="rate-limit-enabled" type="checkbox"/>
+              <span><strong>启用限流</strong><small>只影响 <code>/v1</code> 接口；管理后台与登录不受此处配置影响。</small></span>
+            </label>
+            <div class="rate-limit-grid">
+              <label>统计窗口（秒）<input id="rate-limit-window" type="number" min="1" max="3600" step="1"/><small>两个计数器共用的滚动窗口，1–3600。</small></label>
+              <label>每 IP 鉴权失败上限<input id="rate-limit-failures" type="number" min="0" max="100000" step="1"/><small>窗口内同一 IP 的 401 次数上限，防止匿名扫描；0 = 不限制。</small></label>
+              <label>每 Key 请求上限<input id="rate-limit-key-quota" type="number" min="0" max="10000000" step="1"/><small>窗口内单个客户端 Key 的请求上限；0 = 不限制。</small></label>
+              <label>触发后封禁（秒）<input id="rate-limit-block" type="number" min="0" max="86400" step="1"/><small>超限后持续返回 429 的时长；0 = 仅拒绝到本窗口结束。</small></label>
+            </div>
+            <div class="rate-limit-actions">
+              <p class="section-note" id="rate-limit-summary"></p>
+              <button class="btn btn-primary" id="save-rate-limit" type="button">保存限流规则</button>
+            </div>
+          </section>
         </main>
       </div>
 
@@ -550,6 +601,7 @@ function renderCore(
     gatewayStatusText.textContent = ready ? "运行就绪" : "无可用账号";
   }
   renderConnection(root, state.settings);
+  renderRateLimit(root, state.settings.rateLimit);
   renderCredentials(root, state.credentials, refresh, notice);
   renderClientKeys(root, state.clientKeys, refresh, notice);
 }
@@ -560,6 +612,82 @@ function renderConnection(root: HTMLElement, settings: Settings): void {
   if (publicUrl && document.activeElement !== publicUrl) publicUrl.value = settings.publicBaseUrl || window.location.origin;
   const state = root.querySelector<HTMLElement>("#connection-state");
   if (state) state.textContent = settings.publicBaseUrl ? "自定义地址" : "当前来源";
+}
+
+const DEFAULT_RATE_LIMIT: RateLimitConfig = {
+  enabled: false,
+  windowSeconds: 60,
+  maxFailuresPerIp: 30,
+  maxRequestsPerKey: 0,
+  blockSeconds: 300
+};
+
+function rateLimitInputs(root: HTMLElement) {
+  return {
+    enabled: root.querySelector<HTMLInputElement>("#rate-limit-enabled"),
+    window: root.querySelector<HTMLInputElement>("#rate-limit-window"),
+    failures: root.querySelector<HTMLInputElement>("#rate-limit-failures"),
+    keyQuota: root.querySelector<HTMLInputElement>("#rate-limit-key-quota"),
+    block: root.querySelector<HTMLInputElement>("#rate-limit-block")
+  };
+}
+
+function renderRateLimit(root: HTMLElement, config: RateLimitConfig = DEFAULT_RATE_LIMIT): void {
+  const inputs = rateLimitInputs(root);
+  // Never clobber a field the owner is typing into.
+  const set = (input: HTMLInputElement | null, value: number): void => {
+    if (input && document.activeElement !== input) input.value = String(value);
+  };
+  if (inputs.enabled && document.activeElement !== inputs.enabled) inputs.enabled.checked = config.enabled;
+  set(inputs.window, config.windowSeconds);
+  set(inputs.failures, config.maxFailuresPerIp);
+  set(inputs.keyQuota, config.maxRequestsPerKey);
+  set(inputs.block, config.blockSeconds);
+
+  const badge = root.querySelector<HTMLElement>("#rate-limit-state");
+  if (badge) {
+    badge.textContent = config.enabled ? "已启用" : "已关闭";
+    badge.classList.toggle("ok", config.enabled);
+  }
+  const summary = root.querySelector<HTMLElement>("#rate-limit-summary");
+  if (summary) summary.textContent = rateLimitSummary(config);
+  updateRateLimitDisabledState(root, config.enabled);
+}
+
+function updateRateLimitDisabledState(root: HTMLElement, enabled: boolean): void {
+  const inputs = rateLimitInputs(root);
+  for (const input of [inputs.window, inputs.failures, inputs.keyQuota, inputs.block]) {
+    if (input) input.disabled = !enabled;
+  }
+  root.querySelector<HTMLElement>(".rate-limit-grid")?.classList.toggle("is-disabled", !enabled);
+}
+
+function rateLimitSummary(config: RateLimitConfig): string {
+  if (!config.enabled) return "当前不限流：任何来源都可以按任意速率请求 /v1（未授权请求仍然返回 401）。";
+  const parts: string[] = [];
+  parts.push(config.maxFailuresPerIp > 0
+    ? `同一 IP 在 ${config.windowSeconds} 秒内鉴权失败超过 ${config.maxFailuresPerIp} 次即拒绝`
+    : "不限制单 IP 的鉴权失败次数");
+  parts.push(config.maxRequestsPerKey > 0
+    ? `单个 Key 在 ${config.windowSeconds} 秒内超过 ${config.maxRequestsPerKey} 次请求即拒绝`
+    : "不限制单个 Key 的请求量");
+  parts.push(config.blockSeconds > 0 ? `触发后封禁 ${config.blockSeconds} 秒` : "触发后仅拒绝到本窗口结束");
+  return `${parts.join("；")}。超限返回 429 并带 Retry-After。`;
+}
+
+function readRateLimitForm(root: HTMLElement): RateLimitConfig {
+  const inputs = rateLimitInputs(root);
+  const number = (input: HTMLInputElement | null, fallback: number): number => {
+    const parsed = Number.parseInt(input?.value ?? "", 10);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  };
+  return {
+    enabled: Boolean(inputs.enabled?.checked),
+    windowSeconds: number(inputs.window, DEFAULT_RATE_LIMIT.windowSeconds),
+    maxFailuresPerIp: number(inputs.failures, DEFAULT_RATE_LIMIT.maxFailuresPerIp),
+    maxRequestsPerKey: number(inputs.keyQuota, DEFAULT_RATE_LIMIT.maxRequestsPerKey),
+    blockSeconds: number(inputs.block, DEFAULT_RATE_LIMIT.blockSeconds)
+  };
 }
 
 function renderCredentials(
