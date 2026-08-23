@@ -23,9 +23,23 @@ const ENDPOINTS: Array<{ value: Endpoint; label: string; method: "GET" | "POST" 
   { value: "messages", label: "POST /messages", method: "POST" }
 ];
 
-function markup(baseUrl: string): string {
+function lockedMarkup(): string {
   return `
   <div class="pg-app">
+    ${headerMarkup()}
+    <main class="pg-main">
+      <section class="pg-locked">
+        <span class="pg-locked-mark">${icon("Lock", { width: 22, height: 22 })}</span>
+        <h1>需要管理员登录</h1>
+        <p>API 测试页是网关维护者的工具，只在管理员登录后可用。请先登录管理后台，再回到这里。</p>
+        <a class="pg-locked-action" href="/dashboard">${icon("KeyRound", { width: 16, height: 16 })} 前往管理后台登录</a>
+      </section>
+    </main>
+  </div>`;
+}
+
+function headerMarkup(): string {
+  return `
     <header class="pg-header">
       <a class="pg-brand" href="/">
         <span class="pg-brand-mark">${icon("Terminal", { width: 18, height: 18 })}</span>
@@ -33,7 +47,13 @@ function markup(baseUrl: string): string {
         <span class="pg-sub">/v1 endpoints</span>
       </a>
       <a class="pg-back" href="/dashboard">管理后台</a>
-    </header>
+    </header>`;
+}
+
+function markup(baseUrl: string): string {
+  return `
+  <div class="pg-app">
+    ${headerMarkup()}
 
     <main class="pg-main">
       <form class="pg-form" id="pg-form">
@@ -110,7 +130,35 @@ function baseFor(raw: string): string {
   return raw.trim().replace(/\/+$/, "");
 }
 
+/**
+ * The playground is a maintainer tool, not a public page: it is only rendered for
+ * an authenticated administrator. This does not gate `/v1` itself (every endpoint
+ * already requires a client `sk-` key) - it keeps the tool from being an open
+ * invitation to probe the gateway from a browser.
+ */
 export function mountPlayground(root: HTMLElement): void {
+  void boot(root);
+}
+
+async function boot(root: HTMLElement): Promise<void> {
+  let authenticated = false;
+  try {
+    const response = await fetch("/api/auth/status", { credentials: "same-origin" });
+    const status = await response.json() as { authenticated?: boolean };
+    authenticated = Boolean(status.authenticated);
+  } catch {
+    authenticated = false;
+  }
+
+  if (!authenticated) {
+    root.innerHTML = lockedMarkup();
+    hydrateIcons(root);
+    return;
+  }
+  renderTool(root);
+}
+
+function renderTool(root: HTMLElement): void {
   root.innerHTML = markup(`${window.location.origin}/v1`);
   hydrateIcons(root);
 

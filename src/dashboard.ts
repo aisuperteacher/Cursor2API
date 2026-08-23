@@ -462,7 +462,7 @@ function consoleMarkup(): string {
                 <label>API Base URL<span class="gateway-input"><input id="api-base-url" readonly/><button class="icon-button" type="button" data-copy-target="api-base-url" title="复制 API 地址" aria-label="复制 API 地址">${copy}</button></span></label>
                 <label>对外地址<span class="endpoint-editor"><input id="public-base-url" placeholder="https://api.example.com"/><button class="btn btn-secondary" id="save-public-url" type="button">保存</button></span></label>
               </div>
-              <div class="connection-footnote">客户端仅使用后台生成的 <code>sk-...</code> Key，不会接触 Cursor 凭据。</div>
+              <div class="connection-footnote">客户端仅使用后台生成的 <code>sk-...</code> Key，不会接触 Cursor 凭据。<a class="connection-playground-link" href="/playground">${icon("Terminal", { width: 14, height: 14 })} 打开 API 测试页</a></div>
             </section>
 
             <section id="usage" class="dashboard-section console-card usage-section">

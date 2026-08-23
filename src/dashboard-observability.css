@@ -809,6 +809,21 @@
   color: var(--console-accent);
 }
 
+.connection-playground-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: 8px;
+  color: var(--console-accent);
+  font-weight: 600;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.connection-playground-link:hover {
+  text-decoration: underline;
+}
+
 /* ---------- Usage ---------- */
 .usage-panel {
   display: grid;
