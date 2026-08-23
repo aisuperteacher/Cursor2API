@@ -1,3 +1,4 @@
+import "./chat.css";
 import { escapeAttr, escapeHtml, highlightJson, icon } from "./ui";
 import { assistantDisplayContent, sanitizeAssistantContent } from "./chat-sanitize";
 import { deleteChatImages, loadChatImages, storeChatImages } from "./chat-image-store";

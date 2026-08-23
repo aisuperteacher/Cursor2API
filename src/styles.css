@@ -1054,19 +1054,7 @@ pre {
 }
 
 /* ---------- Legacy chat fallback ---------- */
-.chat-app {
-  min-height: 100vh;
-  display: grid;
-  place-items: center;
-  padding: 24px;
-}
-
-.chat-app button,
-.chat-app input,
-.chat-app textarea {
-  border: 1px solid var(--line);
-  border-radius: 8px;
-}
+/* Chat page styles live in src/chat.css (imported by src/chat.ts). */
 
 /* ---------- Responsive ---------- */
 @media (max-width: 900px) {
