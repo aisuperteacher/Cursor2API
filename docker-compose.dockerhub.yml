@@ -2,9 +2,12 @@ name: cursor2api
 
 # Pull-only deployment. This file intentionally has no build sections, so a
 # server can deploy cursor2api with Docker alone and without cloning the repo.
+# Images default to this repository's own GHCR packages (published by
+# .github/workflows/publish-containers.yml on every push to master); point
+# CURSOR2API_IMAGE_REGISTRY/NAMESPACE elsewhere to use a different source.
 services:
   bridge:
-    image: docker.io/${CURSOR2API_IMAGE_NAMESPACE:-nglsg}/cursor2api-bridge:${CURSOR2API_IMAGE_TAG:-latest}
+    image: ${CURSOR2API_IMAGE_REGISTRY:-ghcr.io}/${CURSOR2API_IMAGE_NAMESPACE:-aisuperteacher}/cursor2api-bridge:${CURSOR2API_IMAGE_TAG:-latest}
     environment:
       CURSOR_SDK_BRIDGE_HOST: 0.0.0.0
       CURSOR_SDK_BRIDGE_PORT: 8792
@@ -22,7 +25,7 @@ services:
     restart: unless-stopped
 
   api:
-    image: docker.io/${CURSOR2API_IMAGE_NAMESPACE:-nglsg}/cursor2api-api:${CURSOR2API_IMAGE_TAG:-latest}
+    image: ${CURSOR2API_IMAGE_REGISTRY:-ghcr.io}/${CURSOR2API_IMAGE_NAMESPACE:-aisuperteacher}/cursor2api-api:${CURSOR2API_IMAGE_TAG:-latest}
     depends_on:
       bridge:
         condition: service_healthy
