@@ -1,11 +1,12 @@
+# Pushes to master no longer build/publish images automatically: the deployment
+# here is a local build, and GHCR images kept being regenerated on every merge,
+# which is what resurfaces the "delete then it comes back" problem. To publish a
+# fresh build when you actually want one, run this workflow manually from the
+# Actions tab (Dispatch). It still tags `latest` on the default branch and a
+# `sha-<commit>` for the commit you run it from.
 name: Publish Docker images
 
 on:
-  push:
-    branches:
-      - master
-    tags:
-      - "v*"
   workflow_dispatch:
 
 permissions:
