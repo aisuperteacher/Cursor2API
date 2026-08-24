@@ -305,8 +305,14 @@ function mountConsole(root: HTMLElement): void {
 
   const accountDialog = root.querySelector<HTMLDialogElement>("#account-dialog")!;
   const keyDialog = root.querySelector<HTMLDialogElement>("#client-key-dialog")!;
-  root.querySelector("#add-account")?.addEventListener("click", () => accountDialog.showModal());
-  root.querySelector("#import-accounts")?.addEventListener("click", () => accountDialog.showModal());
+  root.querySelector("#add-account")?.addEventListener("click", () => {
+    dialogError(root, "account-dialog", "");
+    accountDialog.showModal();
+  });
+  root.querySelector("#import-accounts")?.addEventListener("click", () => {
+    dialogError(root, "account-dialog", "");
+    accountDialog.showModal();
+  });
   root.querySelector("#cancel-account")?.addEventListener("click", () => accountDialog.close());
   root.querySelector("#refresh-all")?.addEventListener("click", () => void refresh());
   root.querySelector("#refresh-logs")?.addEventListener("click", () => loadLogs(true));
@@ -389,7 +395,7 @@ function mountConsole(root: HTMLElement): void {
         : { label: raw.includes("\n") ? `${label} ${index + 1}` : label, cursorApiKey: line.trim() };
     }).filter((item) => item.cursorApiKey);
     if (!entries.length) {
-      notice("请输入至少一把 Cursor API Key", true);
+      dialogError(root, "account-dialog", "请输入至少一把 Cursor API Key（每行一把，支持“名称,Key”格式）");
       return;
     }
     void Promise.all(entries.map((entry) => requestJson("/api/credentials", {
@@ -400,12 +406,13 @@ function mountConsole(root: HTMLElement): void {
       root.querySelector<HTMLFormElement>("#account-form")?.reset();
       return refresh();
     }).then(() => notice("账号已导入"))
-      .catch((error) => notice(error instanceof Error ? error.message : "导入失败", true));
+      .catch((error) => dialogError(root, "account-dialog", error instanceof Error ? error.message : "导入失败"));
   });
 
   root.querySelector("#create-client-key")?.addEventListener("click", () => {
     root.querySelector<HTMLElement>("#client-key-fields")!.hidden = false;
     root.querySelector<HTMLElement>("#client-key-result")!.hidden = true;
+    dialogError(root, "client-key-dialog", "");
     keyDialog.showModal();
   });
   root.querySelector("#cancel-client-key")?.addEventListener("click", () => keyDialog.close());
@@ -421,7 +428,7 @@ function mountConsole(root: HTMLElement): void {
       root.querySelector<HTMLElement>("#client-key-result")!.hidden = false;
       root.querySelector<HTMLInputElement>("#new-client-key")!.value = created.token;
       return refresh();
-    }).catch((error) => notice(error instanceof Error ? error.message : "创建失败", true));
+    }).catch((error) => dialogError(root, "client-key-dialog", error instanceof Error ? error.message : "创建失败"));
   });
 
   hydrateIcons(root);
@@ -566,9 +573,9 @@ function consoleMarkup(): string {
         </main>
       </div>
 
-      <dialog id="account-dialog"><form id="account-form"><div class="dialog-heading"><span class="dialog-mark">${icon("User", { width: 20, height: 20 })}</span><div><h2>添加 Cursor 账号</h2><p>导入后会立即校验模型目录。</p></div></div><p class="section-note account-key-guide">从 <a href="https://cursor.com/dashboard" target="_blank" rel="noreferrer">cursor.com/dashboard</a> 左侧打开 API KEY，点击新建后复制页面显示的 <code>crsr_...</code> 密钥。</p><label>名称<input id="account-label" placeholder="例如：工作账号"/></label><label>Cursor API Key<textarea id="account-value" rows="7" placeholder="支持多行；批量格式为 名称,Key"></textarea></label><div class="dialog-actions"><button class="btn btn-secondary" id="cancel-account" type="button">取消</button><button class="btn btn-primary" type="submit">保存并校验</button></div></form></dialog>
+      <dialog id="account-dialog"><form id="account-form"><div class="dialog-heading"><span class="dialog-mark">${icon("User", { width: 20, height: 20 })}</span><div><h2>添加 Cursor 账号</h2><p>导入后会立即校验模型目录。</p></div></div><p class="section-note account-key-guide">从 <a href="https://cursor.com/dashboard" target="_blank" rel="noreferrer">cursor.com/dashboard</a> 左侧打开 API KEY，点击新建后复制页面显示的 <code>crsr_...</code> 密钥。</p><label>名称<input id="account-label" placeholder="例如：工作账号"/></label><label>Cursor API Key<textarea id="account-value" rows="7" placeholder="支持多行；批量格式为 名称,Key"></textarea></label><p class="dialog-error" hidden></p><div class="dialog-actions"><button class="btn btn-secondary" id="cancel-account" type="button">取消</button><button class="btn btn-primary" type="submit">保存并校验</button></div></form></dialog>
 
-      <dialog id="client-key-dialog"><form id="client-key-form"><div id="client-key-fields"><div class="dialog-heading"><span class="dialog-mark amber">${icon("KeyRound", { width: 20, height: 20 })}</span><div><h2>创建客户端 API Key</h2><p>用于客户端访问网关，不会暴露 Cursor 凭据。</p></div></div><label>名称<input id="client-key-label" placeholder="例如：OpenCode 本机" required/></label><div class="dialog-actions"><button class="btn btn-secondary" id="cancel-client-key" type="button">取消</button><button class="btn btn-primary" type="submit">创建 Key</button></div></div><div id="client-key-result" hidden><h2>保存此 API Key</h2><p class="section-note">关闭窗口后不能再次查看完整 Key。</p><span class="gateway-input"><input id="new-client-key" readonly/><button class="icon-button" type="button" data-copy-target="new-client-key" title="复制 API Key" aria-label="复制 API Key">${copy}</button></span><div class="dialog-actions"><button class="btn btn-primary" id="close-client-key" type="button">完成</button></div></div></form></dialog>
+      <dialog id="client-key-dialog"><form id="client-key-form"><div id="client-key-fields"><div class="dialog-heading"><span class="dialog-mark amber">${icon("KeyRound", { width: 20, height: 20 })}</span><div><h2>创建客户端 API Key</h2><p>用于客户端访问网关，不会暴露 Cursor 凭据。</p></div></div><label>名称<input id="client-key-label" placeholder="例如：OpenCode 本机" required/></label><p class="dialog-error" hidden></p><div class="dialog-actions"><button class="btn btn-secondary" id="cancel-client-key" type="button">取消</button><button class="btn btn-primary" type="submit">创建 Key</button></div></div><div id="client-key-result" hidden><h2>保存此 API Key</h2><p class="section-note">关闭窗口后不能再次查看完整 Key。</p><span class="gateway-input"><input id="new-client-key" readonly/><button class="icon-button" type="button" data-copy-target="new-client-key" title="复制 API Key" aria-label="复制 API Key">${copy}</button></span><div class="dialog-actions"><button class="btn btn-primary" id="close-client-key" type="button">完成</button></div></div></form></dialog>
 
       <dialog id="confirm-dialog" class="confirm-dialog"><form method="dialog"><div class="confirm-icon">${icon("TriangleAlert", { width: 24, height: 24 })}</div><h2 id="confirm-title">确认操作</h2><p id="confirm-message"></p><div class="dialog-actions"><button class="btn btn-secondary" value="cancel">取消</button><button class="btn btn-danger" id="confirm-danger" value="confirm">确认</button></div></form></dialog>
 
@@ -882,6 +889,22 @@ async function copyInput(input: HTMLInputElement, notice: (message: string, erro
     // The browser may block execCommand on non-secure origins.
   }
   notice("浏览器阻止了自动复制，内容已选中，请按 Ctrl+C", true);
+}
+
+/**
+ * Show an error inside an open <dialog>. The global toast (#dashboard-notice)
+ * lives in a fixed layer that a modal dialog covers (dialogs render in the
+ * browser "top layer", above any z-index), so while a dialog is open its
+ * failures must be shown inside the dialog itself or the user sees nothing
+ * until they close it.
+ */
+function dialogError(root: HTMLElement, dialogId: string, message: string): void {
+  const dialog = root.querySelector<HTMLDialogElement>(`#${dialogId}`);
+  if (!dialog) return;
+  const box = dialog.querySelector<HTMLElement>(".dialog-error");
+  if (!box) return;
+  box.hidden = !message;
+  box.textContent = message;
 }
 
 function confirmDanger(

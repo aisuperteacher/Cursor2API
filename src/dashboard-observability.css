@@ -1551,6 +1551,19 @@
   margin-top: 22px;
 }
 
+/* Inline error shown inside an open dialog. The global toast is hidden behind a
+   modal dialog (top layer), so dialog-scoped failures must be visible here. */
+.dialog-error {
+  margin: 12px 0 0;
+  padding: 9px 12px;
+  border: 1px solid rgba(220, 68, 68, 0.35);
+  border-radius: 9px;
+  background: rgba(220, 68, 68, 0.09);
+  color: #b4232a;
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+
 .confirm-dialog {
   width: min(460px, calc(100vw - 32px)) !important;
 }
