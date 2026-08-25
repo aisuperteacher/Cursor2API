@@ -91,6 +91,15 @@ interface GatewayUsage {
   byCredential: CredentialUsage[];
 }
 
+interface OfficialUsageSummary {
+  totalSpend?: number;
+  currency?: string;
+  membershipType?: string;
+  byModel: Array<{ model: string; requests: number; percent: number }>;
+  byDay: Array<{ date: string; requests: number }>;
+  rawFallback?: boolean;
+}
+
 interface UsageResponse {
   gateway: GatewayUsage;
   storage: StorageStats;
@@ -100,6 +109,7 @@ interface UsageResponse {
     range?: { startDate: number; endDate: number };
     spend?: unknown;
     usageEvents?: unknown;
+    summary?: OfficialUsageSummary;
     error?: string;
   };
 }
@@ -812,16 +822,68 @@ function renderPanelError(root: HTMLElement, selector: string, title: string, er
   panel.innerHTML = `<div class="empty-state${compact}"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(message)}。${escapeHtml(hint)}</span></div>`;
 }
 
+function formatCurrency(value: number, currency?: string): string {
+  const symbol = currency?.toLowerCase() === "usd" ? "$"
+    : (currency?.toLowerCase() === "cny" || currency?.toLowerCase() === "rmb") ? "¥"
+    : currency ?? "";
+  return `${symbol}${value.toLocaleString("zh-CN", { maximumFractionDigits: 2 })}`;
+}
+
+/** Visualize the official Cursor usage summary: spend card, model bars, day trend. */
+function officialSummaryMarkup(summary: OfficialUsageSummary): string {
+  const hasSpend = typeof summary.totalSpend === "number";
+  const hasModels = summary.byModel.length > 0;
+  const hasDays = summary.byDay.length > 0;
+  if (!hasSpend && !hasModels && !hasDays) return "";
+
+  const maxDayRequests = Math.max(1, ...summary.byDay.map((item) => item.requests));
+  const bars = summary.byModel.map((item) => `
+    <div class="official-bar">
+      <span class="official-bar-label" title="${escapeHtml(item.model)}">${escapeHtml(item.model)}</span>
+      <span class="official-bar-track"><span class="official-bar-fill" style="width:${Math.min(100, item.percent)}%"></span></span>
+      <span class="official-bar-value">${item.requests} · ${item.percent}%</span>
+    </div>`).join("");
+
+  const trend = hasDays ? `
+    <div class="official-trend">
+      ${summary.byDay.map((item) => {
+        const height = Math.round((item.requests / maxDayRequests) * 100);
+        return `<span class="official-trend-col" title="${escapeHtml(item.date)} · ${item.requests}">
+            <span class="official-trend-fill" style="height:${Math.max(3, height)}%"></span>
+            <em>${escapeHtml(item.date.slice(5))}</em>
+          </span>`;
+      }).join("")}
+    </div>` : "";
+
+  const spendCard = hasSpend ? `
+    <div class="official-spend-card">
+      <span>总花费</span>
+      <strong>${formatCurrency(summary.totalSpend!, summary.currency)}</strong>
+      ${summary.currency ? `<em>${escapeHtml(summary.currency.toUpperCase())}</em>` : ""}
+    </div>` : "";
+
+  return `
+    <div class="official-summary">
+      ${spendCard}
+      ${hasModels ? `<div class="official-panel"><div class="official-panel-title">模型用量</div><div class="official-bars">${bars}</div></div>` : ""}
+      ${trend ? `<div class="official-panel"><div class="official-panel-title">用量趋势（近 ${summary.byDay.length} 天）</div>${trend}</div>` : ""}
+    </div>`;
+}
+
 function renderUsage(root: HTMLElement, usage: UsageResponse): void {
   const panel = root.querySelector<HTMLElement>("#usage-panel")!;
   const gateway = usage.gateway;
   const storage = usage.storage;
   const official = usage.official;
+  const summaryMarkup = official.configured && !official.error && official.summary && !official.summary.rawFallback
+    ? officialSummaryMarkup(official.summary)
+    : "";
+  const rawDetails = `<details class="official-usage-details"${summaryMarkup ? "" : " open"}><summary>查看 Cursor 官方团队用量原始数据</summary><div class="official-meta">更新时间 ${escapeHtml(formatDate(official.fetchedAt || ""))}</div><pre>${escapeHtml(JSON.stringify({ spend: official.spend, usageEvents: official.usageEvents }, null, 2))}</pre></details>`;
   const officialMarkup = !official.configured
     ? `<div class="official-usage-note"><span class="official-icon">${icon("ShieldCheck", { width: 17, height: 17 })}</span><div><strong>Cursor 官方用量未配置</strong><span>设置 <code>CURSOR_ADMIN_API_KEY</code> 后，可读取团队 spending 和 usage events。当前只显示经过本网关的请求。</span></div></div>`
     : official.error
       ? `<div class="official-usage-note error"><span class="official-icon">${icon("TriangleAlert", { width: 17, height: 17 })}</span><div><strong>Cursor 官方用量查询失败</strong><span>${escapeHtml(official.error)}</span></div></div>`
-      : `<details class="official-usage-details"><summary>查看 Cursor 官方团队用量原始数据</summary><div class="official-meta">更新时间 ${escapeHtml(formatDate(official.fetchedAt || ""))}</div><pre>${escapeHtml(JSON.stringify({ spend: official.spend, usageEvents: official.usageEvents }, null, 2))}</pre></details>`;
+      : `${summaryMarkup}${rawDetails}`;
   panel.innerHTML = `
     <div class="usage-cards">
       <div class="usage-card"><span>保留请求</span><strong>${gateway.retainedRequests}</strong><small>${gateway.lastRequestAt ? `最近 ${escapeHtml(formatDate(gateway.lastRequestAt))}` : "暂无请求"}</small></div>
