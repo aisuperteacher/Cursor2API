@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LocalAuthStore, sessionTokenFromCookie } from "./auth";
-import { fetchCursorAdminUsage } from "./cursor-admin";
+import { fetchCursorAdminUsage, summarizeOfficialUsage } from "./cursor-admin";
 import { RequestLogStore, type RequestLogEntry } from "./request-log";
 import { CursorCredentialPool } from "./router";
 

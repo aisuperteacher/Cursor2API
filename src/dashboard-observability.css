@@ -1079,6 +1079,127 @@
   margin-top: 8px;
 }
 
+/* ---------- Official usage summary visualization ---------- */
+.official-summary {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.official-spend-card {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--console-line);
+  border-radius: 10px;
+  background: var(--console-surface-soft);
+}
+
+.official-spend-card span {
+  color: var(--console-muted);
+  font-size: 0.78rem;
+}
+
+.official-spend-card strong {
+  font-size: 1.4rem;
+  color: var(--console-text);
+}
+
+.official-spend-card em {
+  margin-left: auto;
+  font-style: normal;
+  font-size: 0.72rem;
+  color: var(--console-muted);
+}
+
+.official-panel {
+  padding: 12px 14px;
+  border: 1px solid var(--console-line);
+  border-radius: 10px;
+  background: var(--console-surface-soft);
+}
+
+.official-panel-title {
+  margin-bottom: 10px;
+  color: var(--console-muted);
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.official-bars {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.official-bar {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) minmax(0, 3fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.official-bar-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.78rem;
+  color: var(--console-text);
+}
+
+.official-bar-track {
+  height: 8px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.official-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: 6px;
+  background: linear-gradient(90deg, var(--console-accent), var(--console-accent-2, #7d7bff));
+}
+
+.official-bar-value {
+  min-width: 66px;
+  text-align: right;
+  font-size: 0.74rem;
+  color: var(--console-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.official-trend {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  height: 96px;
+}
+
+.official-trend-col {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  height: 100%;
+}
+
+.official-trend-fill {
+  width: 100%;
+  max-width: 26px;
+  border-radius: 4px 4px 0 0;
+  background: linear-gradient(180deg, var(--console-accent), var(--console-accent-2, #7d7bff));
+}
+
+.official-trend-col em {
+  font-style: normal;
+  font-size: 0.62rem;
+  color: var(--console-muted);
+}
+
 /* ---------- Credential pool ---------- */
 .credential-table-wrap,
 .client-key-table-wrap {
