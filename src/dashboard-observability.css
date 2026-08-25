@@ -1200,31 +1200,51 @@
   color: var(--console-muted);
 }
 
-/* ---------- Per-account official quota (crsr_ -> usage-summary) ---------- */
+/* ---------- Per-account official usage (crsr_ -> access_token) ---------- */
 .account-usage {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 5px;
   margin-top: 6px;
   padding-top: 6px;
   border-top: 1px dashed var(--console-line);
 }
 
-.au-type {
-  font-size: 0.68rem;
-  color: var(--console-accent);
-  font-weight: 600;
+.au-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
 }
 
-.au-bars {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
+.au-type {
+  padding: 1px 7px;
+  border-radius: 5px;
+  background: var(--console-accent-soft);
+  color: var(--console-accent);
+  font-size: 0.68rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.au-stat {
+  font-size: 0.7rem;
+  color: var(--console-muted);
+}
+
+.au-stat b {
+  color: var(--console-ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.au-period {
+  color: var(--console-faint);
+  font-size: 0.66rem;
 }
 
 .au-row {
   display: grid;
-  grid-template-columns: 38px minmax(0, 1fr) 30px;
+  grid-template-columns: 32px minmax(0, 1fr) 34px;
   align-items: center;
   gap: 8px;
 }
@@ -1238,7 +1258,7 @@
 .au-track {
   height: 6px;
   border-radius: 5px;
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--console-surface-muted);
   overflow: hidden;
 }
 
@@ -1246,12 +1266,12 @@
   display: block;
   height: 100%;
   border-radius: 5px;
-  background: linear-gradient(90deg, var(--console-accent), var(--console-accent-2, #7d7bff));
+  background: var(--console-accent);
 }
 
 .au-row b {
   font-size: 0.68rem;
-  color: var(--console-soft);
+  color: var(--console-muted);
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
@@ -1259,7 +1279,7 @@
 .account-usage-error {
   display: block;
   margin-top: 6px;
-  color: #ff8a9a;
+  color: var(--console-danger);
 }
 
 /* ---------- Credential pool ---------- */
