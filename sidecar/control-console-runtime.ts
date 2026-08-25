@@ -3,6 +3,8 @@ import { randomUUID } from "node:crypto";
 import http, { type IncomingMessage, type RequestListener, type ServerResponse } from "node:http";
 import { syncBuiltinESMExports } from "node:module";
 import { fetchCursorAdminUsage, type CursorAdminUsageSnapshot } from "./cursor-admin";
+import { createAccountUsageFetcher, type AccountUsageSummary } from "./cursor-usage";
+import type { Deps, Env } from "../worker/types";
 import { LocalAuthStore, sessionTokenFromCookie } from "./auth";
 import { RequestLogStore, type RequestLogEntry, type RequestLogQuery } from "./request-log";
 import { canonicalModelId, CursorCredentialPool, parseCursorCredentialEnv, type PoolCredential } from "./router";
@@ -77,6 +79,27 @@ export function installControlConsoleRuntime(): ControlConsoleRuntime {
   };
   const downstreamAwareFetch = globalThis.fetch.bind(globalThis);
 
+  // Per-account official quota: exchange the crsr_ key for an access token, then
+  // call cursor.com/api/usage-summary. Read-only admin data; cached 60s.
+  const usageEnv: Env = {
+    ASSETS: undefined,
+    DB: undefined,
+    ENCRYPTION_KEY: process.env.ENCRYPTION_KEY || "api-for-cursor",
+    CURSOR_API_BASE: process.env.CURSOR_API_BASE || "https://api.cursor.com",
+    CURSOR_BACKEND_BASE_URL: undefined,
+    CURSOR_CHAT_ENDPOINT: undefined,
+    CURSOR_CLIENT_VERSION: process.env.CURSOR_CLIENT_VERSION || "2.6.22",
+    CURSOR_SDK_BRIDGE_URL: undefined,
+    CURSOR_SDK_BRIDGE_TOKEN: undefined,
+    CURSOR_SDK_BRIDGE_TIMEOUT_MS: undefined
+  } as unknown as Env;
+  const usageDeps: Deps = {
+    fetch: downstreamAwareFetch,
+    now: () => new Date(),
+    randomUUID: () => crypto.randomUUID()
+  };
+  const accountUsageFetcher = createAccountUsageFetcher(usageEnv, usageDeps);
+
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     inspectBridgeRequest(runtimeContext.getStore(), input, init, credentialPool);
     return downstreamAwareFetch(input, init);
@@ -119,7 +142,8 @@ export function installControlConsoleRuntime(): ControlConsoleRuntime {
             });
             adminUsageCache.promise = promise;
             return promise;
-          }
+          },
+          getAccountUsage: (apiKey) => accountUsageFetcher(apiKey)
         }).catch((error) => writeError(response, error));
         return;
       }
@@ -151,6 +175,7 @@ interface ControlRouteDeps {
   modelCache: Map<string, CachedModels>;
   fetchImpl: typeof fetch;
   getAdminUsage: () => Promise<CursorAdminUsageSnapshot>;
+  getAccountUsage: (apiKey: string) => Promise<AccountUsageSummary>;
 }
 
 async function handleControlRoute(deps: ControlRouteDeps): Promise<void> {
@@ -250,7 +275,17 @@ async function handleControlRoute(deps: ControlRouteDeps): Promise<void> {
 async function handleCredentialList(deps: ControlRouteDeps): Promise<void> {
   const usage = await deps.requestLogs.usageSummary();
   const usageByCredential = new Map(usage.byCredential.map((item) => [item.credentialId, item]));
-  const data = await Promise.all(deps.credentialPool.credentials.map(async (credential) => {
+  // 并发拉每个账号的官方额度（exchange crsr_ → usage-summary），单个失败不阻塞列表。
+  const accountUsages = await Promise.all(
+    deps.credentialPool.credentials.map(async (credential) => {
+      try {
+        return await deps.getAccountUsage(credential.apiKey);
+      } catch {
+        return { rawFallback: false, error: "额度查询失败" } as AccountUsageSummary;
+      }
+    })
+  );
+  const data = await Promise.all(deps.credentialPool.credentials.map(async (credential, index) => {
     let models: string[] = [];
     if (credential.status === "active") {
       try {
@@ -271,7 +306,8 @@ async function handleCredentialList(deps: ControlRouteDeps): Promise<void> {
       source: credential.environment ? "environment" : "console",
       models,
       disabledModels: [...credential.disabledModels],
-      usage: usageByCredential.get(credential.id) || null
+      usage: usageByCredential.get(credential.id) || null,
+      accountUsage: accountUsages[index]
     };
   }));
   writeJson(deps.response, { data });

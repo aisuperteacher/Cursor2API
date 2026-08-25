@@ -15,6 +15,15 @@ interface CredentialUsage {
   models: string[];
 }
 
+interface AccountUsageSummary {
+  totalPercent?: number;
+  autoPercent?: number;
+  apiPercent?: number;
+  membershipType?: string;
+  rawFallback?: boolean;
+  error?: string;
+}
+
 interface Credential {
   id: string;
   label: string;
@@ -25,6 +34,7 @@ interface Credential {
   source: "console" | "environment";
   models: string[];
   usage?: CredentialUsage | null;
+  accountUsage?: AccountUsageSummary | null;
 }
 
 interface ClientKey {
@@ -727,7 +737,7 @@ function renderCredentials(
         const deleteAction = item.managed
           ? `<button class="icon-button danger" data-delete-account="${escapeHtml(item.id)}" title="永久删除账号" aria-label="永久删除账号">${icon("Trash2", { width: 16, height: 16 })}</button>`
           : `<button class="btn btn-compact btn-ghost" data-env-help="${escapeHtml(item.id)}" type="button">移除方法</button>`;
-        return `<div class="credential-row"><div class="credential-identity"><div class="credential-avatar">${escapeHtml(item.label.slice(0, 1).toUpperCase() || "C")}</div><div><strong>${escapeHtml(item.label)}</strong><code>••••${escapeHtml(item.hint)}</code><span class="source-badge ${item.managed ? "managed" : "environment"}">${source}</span></div></div><div class="credential-models">${modelPills(item.models)}<small>${escapeHtml(usageText)}</small></div><div><span class="credential-status ${item.status === "active" ? "ok" : "disabled"}">${item.status === "active" ? "可用" : "已禁用"}</span>${item.disabledReason ? `<small>${escapeHtml(item.disabledReason)}</small>` : ""}</div><div class="credential-actions">${statusAction}${deleteAction}</div></div>`;
+        return `<div class="credential-row"><div class="credential-identity"><div class="credential-avatar">${escapeHtml(item.label.slice(0, 1).toUpperCase() || "C")}</div><div><strong>${escapeHtml(item.label)}</strong><code>••••${escapeHtml(item.hint)}</code><span class="source-badge ${item.managed ? "managed" : "environment"}">${source}</span></div></div><div class="credential-models">${modelPills(item.models)}<small>${escapeHtml(usageText)}</small>${accountUsageMarkup(item.accountUsage)}</div><div><span class="credential-status ${item.status === "active" ? "ok" : "disabled"}">${item.status === "active" ? "可用" : "已禁用"}</span>${item.disabledReason ? `<small>${escapeHtml(item.disabledReason)}</small>` : ""}</div><div class="credential-actions">${statusAction}${deleteAction}</div></div>`;
       }).join("")
     : `<div class="empty-state"><strong>还没有 Cursor 账号</strong><span>添加第一把账号 Key，开始建立账号池。</span></div>`;
 
@@ -820,6 +830,22 @@ function renderPanelError(root: HTMLElement, selector: string, title: string, er
     : "请稍后重试，或检查服务运行状态。";
   const compact = selector === "#usage-panel" ? " compact" : "";
   panel.innerHTML = `<div class="empty-state${compact}"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(message)}。${escapeHtml(hint)}</span></div>`;
+}
+
+function accountUsageMarkup(usage?: AccountUsageSummary | null): string {
+  if (!usage) return "";
+  if (usage.error) return `<small class="account-usage-error">额度查询失败：${escapeHtml(usage.error)}</small>`;
+  const hasAny = typeof usage.totalPercent === "number" || typeof usage.autoPercent === "number" || typeof usage.apiPercent === "number";
+  if (usage.rawFallback || !hasAny) return "";
+  const row = (label: string, value?: number): string => {
+    if (typeof value !== "number") return "";
+    const pct = Math.min(100, Math.max(0, Math.round(value)));
+    return `<span class="au-row"><em>${label}</em><span class="au-track"><span class="au-fill" style="width:${pct}%"></span></span><b>${pct}%</b></span>`;
+  };
+  const bars = row("Total", usage.totalPercent) + row("Auto", usage.autoPercent) + row("API", usage.apiPercent);
+  if (!bars) return "";
+  const type = usage.membershipType ? `<span class="au-type">${escapeHtml(usage.membershipType)}</span>` : "";
+  return `<div class="account-usage">${type}<div class="au-bars">${bars}</div></div>`;
 }
 
 function formatCurrency(value: number, currency?: string): string {
