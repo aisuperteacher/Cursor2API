@@ -1200,6 +1200,68 @@
   color: var(--console-muted);
 }
 
+/* ---------- Per-account official quota (crsr_ -> usage-summary) ---------- */
+.account-usage {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--console-line);
+}
+
+.au-type {
+  font-size: 0.68rem;
+  color: var(--console-accent);
+  font-weight: 600;
+}
+
+.au-bars {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.au-row {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr) 30px;
+  align-items: center;
+  gap: 8px;
+}
+
+.au-row em {
+  font-style: normal;
+  font-size: 0.68rem;
+  color: var(--console-muted);
+}
+
+.au-track {
+  height: 6px;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.au-fill {
+  display: block;
+  height: 100%;
+  border-radius: 5px;
+  background: linear-gradient(90deg, var(--console-accent), var(--console-accent-2, #7d7bff));
+}
+
+.au-row b {
+  font-size: 0.68rem;
+  color: var(--console-soft);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.account-usage-error {
+  display: block;
+  margin-top: 6px;
+  color: #ff8a9a;
+}
+
 /* ---------- Credential pool ---------- */
 .credential-table-wrap,
 .client-key-table-wrap {
