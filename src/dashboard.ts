@@ -16,11 +16,15 @@ interface CredentialUsage {
 }
 
 interface AccountUsageSummary {
-  totalPercent?: number;
-  autoPercent?: number;
-  apiPercent?: number;
   membershipType?: string;
-  rawFallback?: boolean;
+  spendUsd?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  requests?: number;
+  requestLimit?: number;
+  percentUsed?: number;
+  periodStart?: string;
   error?: string;
 }
 
@@ -832,20 +836,41 @@ function renderPanelError(root: HTMLElement, selector: string, title: string, er
   panel.innerHTML = `<div class="empty-state${compact}"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(message)}。${escapeHtml(hint)}</span></div>`;
 }
 
+function formatTokenCount(value: number): string {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(value < 10_000_000 ? 1 : 0)}M`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(value < 10_000 ? 1 : 0)}K`;
+  return String(Math.round(value));
+}
+
 function accountUsageMarkup(usage?: AccountUsageSummary | null): string {
   if (!usage) return "";
-  if (usage.error) return `<small class="account-usage-error">额度查询失败：${escapeHtml(usage.error)}</small>`;
-  const hasAny = typeof usage.totalPercent === "number" || typeof usage.autoPercent === "number" || typeof usage.apiPercent === "number";
-  if (usage.rawFallback || !hasAny) return "";
-  const row = (label: string, value?: number): string => {
-    if (typeof value !== "number") return "";
-    const pct = Math.min(100, Math.max(0, Math.round(value)));
-    return `<span class="au-row"><em>${label}</em><span class="au-track"><span class="au-fill" style="width:${pct}%"></span></span><b>${pct}%</b></span>`;
-  };
-  const bars = row("Total", usage.totalPercent) + row("Auto", usage.autoPercent) + row("API", usage.apiPercent);
-  if (!bars) return "";
-  const type = usage.membershipType ? `<span class="au-type">${escapeHtml(usage.membershipType)}</span>` : "";
-  return `<div class="account-usage">${type}<div class="au-bars">${bars}</div></div>`;
+  if (usage.error) return `<small class="account-usage-error">官方用量查询失败：${escapeHtml(usage.error)}</small>`;
+
+  const chips: string[] = [];
+  if (usage.membershipType) chips.push(`<span class="au-type">${escapeHtml(usage.membershipType)}</span>`);
+  if (typeof usage.spendUsd === "number") {
+    chips.push(`<span class="au-stat">本月 <b>$${usage.spendUsd.toFixed(usage.spendUsd < 1 ? 3 : 2)}</b></span>`);
+  }
+  if (typeof usage.requests === "number" && (usage.requests > 0 || typeof usage.requestLimit === "number")) {
+    const limit = typeof usage.requestLimit === "number" ? ` / ${usage.requestLimit}` : "";
+    chips.push(`<span class="au-stat">请求 <b>${usage.requests}${limit}</b></span>`);
+  }
+  const tokens = (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0);
+  if (tokens > 0) {
+    const cache = usage.cacheReadTokens ? ` · 缓存 ${formatTokenCount(usage.cacheReadTokens)}` : "";
+    chips.push(`<span class="au-stat">Token <b>${formatTokenCount(tokens)}</b>${cache}</span>`);
+  }
+
+  // 仅有配额上限的套餐（如 pro）才有百分比可画；free 版 maxRequestUsage 为空，不画假进度。
+  const bar = typeof usage.percentUsed === "number"
+    ? `<span class="au-row"><em>配额</em><span class="au-track"><span class="au-fill" style="width:${usage.percentUsed}%"></span></span><b>${usage.percentUsed}%</b></span>`
+    : "";
+
+  if (!chips.length && !bar) return "";
+  const period = usage.periodStart
+    ? `<small class="au-period">计费周期自 ${escapeHtml(formatDate(usage.periodStart))}</small>`
+    : "";
+  return `<div class="account-usage"><div class="au-chips">${chips.join("")}</div>${bar}${period}</div>`;
 }
 
 function formatCurrency(value: number, currency?: string): string {

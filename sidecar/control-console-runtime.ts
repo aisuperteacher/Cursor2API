@@ -4,7 +4,6 @@ import http, { type IncomingMessage, type RequestListener, type ServerResponse }
 import { syncBuiltinESMExports } from "node:module";
 import { fetchCursorAdminUsage, type CursorAdminUsageSnapshot } from "./cursor-admin";
 import { createAccountUsageFetcher, type AccountUsageSummary } from "./cursor-usage";
-import type { Deps, Env } from "../worker/types";
 import { LocalAuthStore, sessionTokenFromCookie } from "./auth";
 import { RequestLogStore, type RequestLogEntry, type RequestLogQuery } from "./request-log";
 import { canonicalModelId, CursorCredentialPool, parseCursorCredentialEnv, type PoolCredential } from "./router";
@@ -79,26 +78,8 @@ export function installControlConsoleRuntime(): ControlConsoleRuntime {
   };
   const downstreamAwareFetch = globalThis.fetch.bind(globalThis);
 
-  // Per-account official quota: exchange the crsr_ key for an access token, then
-  // call cursor.com/api/usage-summary. Read-only admin data; cached 60s.
-  const usageEnv: Env = {
-    ASSETS: undefined,
-    DB: undefined,
-    ENCRYPTION_KEY: process.env.ENCRYPTION_KEY || "api-for-cursor",
-    CURSOR_API_BASE: process.env.CURSOR_API_BASE || "https://api.cursor.com",
-    CURSOR_BACKEND_BASE_URL: undefined,
-    CURSOR_CHAT_ENDPOINT: undefined,
-    CURSOR_CLIENT_VERSION: process.env.CURSOR_CLIENT_VERSION || "2.6.22",
-    CURSOR_SDK_BRIDGE_URL: undefined,
-    CURSOR_SDK_BRIDGE_TOKEN: undefined,
-    CURSOR_SDK_BRIDGE_TIMEOUT_MS: undefined
-  } as unknown as Env;
-  const usageDeps: Deps = {
-    fetch: downstreamAwareFetch,
-    now: () => new Date(),
-    randomUUID: () => crypto.randomUUID()
-  };
-  const accountUsageFetcher = createAccountUsageFetcher(usageEnv, usageDeps);
+  // 每个账号的官方用量：crsr_ 换 access_token 后读订阅/请求数/本月消耗。只读，缓存 60s。
+  const accountUsageFetcher = createAccountUsageFetcher({ fetchImpl: downstreamAwareFetch });
 
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     inspectBridgeRequest(runtimeContext.getStore(), input, init, credentialPool);
