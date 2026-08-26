@@ -14,6 +14,16 @@ import { createHash } from "node:crypto";
  * 注意 cursor.com/api/usage-summary 需要网页 session cookie，用 api_key_token
  * 访问返回 401，因此这里不使用它。
  */
+export interface AccountModelUsage {
+  model: string;
+  /** Cursor 自家模型（cursor-* / Cursor * / composer*）与第三方分开小计。 */
+  cursorOwn: boolean;
+  spendUsd: number;
+  requests: number;
+  /** 占该账号本周期总花费的百分比。 */
+  percent: number;
+}
+
 export interface AccountUsageSummary {
   membershipType?: string;
   /** 本月累计花费（美元）。 */
@@ -26,6 +36,12 @@ export interface AccountUsageSummary {
   requestLimit?: number;
   percentUsed?: number;
   periodStart?: string;
+  /** 本周期内按模型聚合的花费排行（降序）。 */
+  byModel?: AccountModelUsage[];
+  /** 本周期内 Cursor 自家 / 第三方模型花费小计（美元与占比）。 */
+  cursorOwnSpendUsd?: number;
+  thirdPartySpendUsd?: number;
+  cursorOwnPercent?: number;
   fetchedAt?: string;
   error?: string;
 }
@@ -34,9 +50,17 @@ const EXCHANGE_URL = "https://api2.cursor.sh/auth/exchange_user_api_key";
 const PROFILE_URL = "https://api2.cursor.sh/auth/full_stripe_profile";
 const USAGE_URL = "https://api2.cursor.sh/auth/usage";
 const AGGREGATED_URL = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetAggregatedUsageEvents";
+const FILTERED_EVENTS_URL = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetFilteredUsageEvents";
+const EVENTS_PAGE_SIZE = 500;
+const MAX_MODEL_ROWS = 8;
 const CACHE_TTL_MS = 60_000;
 const MAX_CACHE_ENTRIES = 500;
 const REQUEST_TIMEOUT_MS = 10_000;
+
+/** Cursor 自家模型：cursor-grok-*、Cursor Grok 4.6 (Auto)、composer-* 等。 */
+function isCursorOwnModel(model: string): boolean {
+  return /^cursor[-\s]/i.test(model) || /^composer/i.test(model);
+}
 
 export interface AccountUsageOptions {
   fetchImpl?: typeof fetch;
@@ -77,11 +101,16 @@ async function fetchAccountUsage(apiKey: string, fetchImpl: typeof fetch): Promi
   const accessToken = await exchangeApiKey(apiKey, fetchImpl);
   const headers = { authorization: `Bearer ${accessToken}`, "content-type": "application/json" };
 
-  // 三个端点互不依赖：任一失败不应让整个额度区块消失。
-  const [profile, usage, aggregated] = await Promise.all([
+  // 四个端点互不依赖：任一失败不应让整个用量区块消失。
+  const [profile, usage, aggregated, events] = await Promise.all([
     requestJson(fetchImpl, PROFILE_URL, { headers }).catch(() => null),
     requestJson(fetchImpl, USAGE_URL, { headers }).catch(() => null),
-    requestJson(fetchImpl, AGGREGATED_URL, { method: "POST", headers, body: "{}" }).catch(() => null)
+    requestJson(fetchImpl, AGGREGATED_URL, { method: "POST", headers, body: "{}" }).catch(() => null),
+    requestJson(fetchImpl, FILTERED_EVENTS_URL, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ pageSize: EVENTS_PAGE_SIZE })
+    }).catch(() => null)
   ]);
 
   const summary: AccountUsageSummary = {};
@@ -123,7 +152,61 @@ async function fetchAccountUsage(apiKey: string, fetchImpl: typeof fetch): Promi
     summary.percentUsed = Math.min(100, Math.max(0, Math.round((requests / limit) * 100)));
   }
 
+  applyModelBreakdown(summary, events, summary.periodStart);
+
   return summary;
+}
+
+/**
+ * 按模型聚合本计费周期内的花费。GetFilteredUsageEvents 返回逐条事件（含跨周期的
+ * 历史），因此用 /auth/usage 的 startOfMonth 过滤后再聚合，与"本月花费"语义一致。
+ * 拿不到配额上限，所以百分比是"占本账号周期总花费的比例"，不是"已用/配额"。
+ */
+function applyModelBreakdown(summary: AccountUsageSummary, events: unknown, periodStart?: string): void {
+  const list = toRecord(events).usageEventsDisplay;
+  if (!Array.isArray(list) || !list.length) return;
+
+  const cutoff = periodStart ? Date.parse(periodStart) : Number.NaN;
+  const buckets = new Map<string, { spendCents: number; requests: number; cursorOwn: boolean }>();
+  let totalCents = 0;
+  let ownCents = 0;
+
+  for (const item of list) {
+    const event = toRecord(item);
+    if (Number.isFinite(cutoff)) {
+      const timestamp = pickNumber(event, ["timestamp"]);
+      if (timestamp !== undefined && timestamp < cutoff) continue;
+    }
+    const model = pickString(event, ["model"]) || "(unknown)";
+    const cents = pickNumber(event, ["chargedCents"]) ?? 0;
+    const cursorOwn = isCursorOwnModel(model);
+    const bucket = buckets.get(model) || { spendCents: 0, requests: 0, cursorOwn };
+    bucket.spendCents += cents;
+    bucket.requests += 1;
+    buckets.set(model, bucket);
+    totalCents += cents;
+    if (cursorOwn) ownCents += cents;
+  }
+
+  if (!buckets.size) return;
+
+  summary.byModel = [...buckets.entries()]
+    .map(([model, bucket]) => ({
+      model,
+      cursorOwn: bucket.cursorOwn,
+      spendUsd: bucket.spendCents / 100,
+      requests: bucket.requests,
+      percent: totalCents > 0 ? Math.round((bucket.spendCents / totalCents) * 100) : 0
+    }))
+    .sort((left, right) => right.spendUsd - left.spendUsd)
+    .slice(0, MAX_MODEL_ROWS);
+
+  summary.cursorOwnSpendUsd = ownCents / 100;
+  summary.thirdPartySpendUsd = (totalCents - ownCents) / 100;
+  summary.cursorOwnPercent = totalCents > 0 ? Math.round((ownCents / totalCents) * 100) : 0;
+
+  // GetAggregatedUsageEvents 默认只覆盖当天；事件聚合才是整个计费周期的真实总额。
+  if (totalCents > 0) summary.spendUsd = totalCents / 100;
 }
 
 async function exchangeApiKey(apiKey: string, fetchImpl: typeof fetch): Promise<string> {
