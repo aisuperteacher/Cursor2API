@@ -20,12 +20,31 @@ export interface AccountModelUsage {
   cursorOwn: boolean;
   spendUsd: number;
   requests: number;
-  /** 占该账号本周期总花费的百分比。 */
+  /** 占所属分组花费的百分比。 */
   percent: number;
 }
 
+/**
+ * 按计费方式分组。Cursor 的 usage event kind 决定这笔消耗是否额外花钱：
+ *   USAGE_EVENT_KIND_INCLUDED_IN_BUSINESS / CUSTOM_SUBSCRIPTION → 套餐内已包含
+ *   USAGE_EVENT_KIND_USAGE_BASED                                → 按量付费（额外支出）
+ * 这比按模型名前缀猜"自家/第三方"更能反映真实账单。
+ */
+export interface AccountUsageGroup {
+  kind: "included" | "usageBased";
+  spendUsd: number;
+  requests: number;
+  /** 占该账号本周期总花费的百分比。 */
+  percent: number;
+  byModel: AccountModelUsage[];
+}
+
 export interface AccountUsageSummary {
+  /** 事件里体现的真实套餐（enterprise / team / pro / free 等），优先于 membershipType。 */
+  plan?: string;
+  /** full_stripe_profile 报告的个人订阅类型，可能与 plan 不一致。 */
   membershipType?: string;
+  isTeamMember?: boolean;
   /** 本月累计花费（美元）。 */
   spendUsd?: number;
   inputTokens?: number;
@@ -36,8 +55,8 @@ export interface AccountUsageSummary {
   requestLimit?: number;
   percentUsed?: number;
   periodStart?: string;
-  /** 本周期内按模型聚合的花费排行（降序）。 */
-  byModel?: AccountModelUsage[];
+  /** 按计费方式分组的花费（套餐内 / 按量付费），各组内含模型排行。 */
+  groups?: AccountUsageGroup[];
   /** 本周期内 Cursor 自家 / 第三方模型花费小计（美元与占比）。 */
   cursorOwnSpendUsd?: number;
   thirdPartySpendUsd?: number;
@@ -118,6 +137,7 @@ async function fetchAccountUsage(apiKey: string, fetchImpl: typeof fetch): Promi
   const profileObj = toRecord(profile);
   const membership = pickString(profileObj, ["membershipType", "individualMembershipType", "teamMembershipType"]);
   if (membership) summary.membershipType = membership;
+  if (profileObj.isTeamMember === true) summary.isTeamMember = true;
 
   const aggObj = toRecord(aggregated);
   const cents = pickNumber(aggObj, ["totalCostCents"]);
@@ -158,16 +178,20 @@ async function fetchAccountUsage(apiKey: string, fetchImpl: typeof fetch): Promi
 }
 
 /**
- * 按模型聚合本计费周期内的花费。GetFilteredUsageEvents 返回逐条事件（含跨周期的
- * 历史），因此用 /auth/usage 的 startOfMonth 过滤后再聚合，与"本月花费"语义一致。
- * 拿不到配额上限，所以百分比是"占本账号周期总花费的比例"，不是"已用/配额"。
+ * 按计费方式分组聚合本计费周期内的花费。GetFilteredUsageEvents 返回逐条事件（含跨
+ * 周期的历史），因此用 /auth/usage 的 startOfMonth 过滤后再聚合。
+ *
+ * 拿不到配额上限（maxRequestUsage / GetHardLimit 实测均为空），所以百分比是"占比"
+ * 而非"已用/配额"：分组条是占账号周期总额的比例，模型条是占所属分组的比例。
  */
 function applyModelBreakdown(summary: AccountUsageSummary, events: unknown, periodStart?: string): void {
   const list = toRecord(events).usageEventsDisplay;
   if (!Array.isArray(list) || !list.length) return;
 
   const cutoff = periodStart ? Date.parse(periodStart) : Number.NaN;
-  const buckets = new Map<string, { spendCents: number; requests: number; cursorOwn: boolean }>();
+  type Group = { spendCents: number; requests: number; models: Map<string, { cents: number; requests: number; cursorOwn: boolean }> };
+  const groups = new Map<"included" | "usageBased", Group>();
+  const planVotes = new Map<string, number>();
   let totalCents = 0;
   let ownCents = 0;
 
@@ -179,27 +203,57 @@ function applyModelBreakdown(summary: AccountUsageSummary, events: unknown, peri
     }
     const model = pickString(event, ["model"]) || "(unknown)";
     const cents = pickNumber(event, ["chargedCents"]) ?? 0;
+    const kindRaw = pickString(event, ["kind"]) || "";
+    const groupKind: "included" | "usageBased" = /USAGE_BASED/i.test(kindRaw) ? "usageBased" : "included";
     const cursorOwn = isCursorOwnModel(model);
-    const bucket = buckets.get(model) || { spendCents: 0, requests: 0, cursorOwn };
-    bucket.spendCents += cents;
+
+    // 事件里的 subscriptionProductId / customSubscriptionName 才是实际生效的套餐；
+    // full_stripe_profile 的 membershipType 可能与之矛盾（实测 free vs enterprise-legacy）。
+    const planHint = pickString(event, ["subscriptionProductId", "customSubscriptionName"]);
+    if (planHint) planVotes.set(planHint, (planVotes.get(planHint) ?? 0) + 1);
+
+    const group = groups.get(groupKind) || { spendCents: 0, requests: 0, models: new Map() };
+    group.spendCents += cents;
+    group.requests += 1;
+    const bucket = group.models.get(model) || { cents: 0, requests: 0, cursorOwn };
+    bucket.cents += cents;
     bucket.requests += 1;
-    buckets.set(model, bucket);
+    group.models.set(model, bucket);
+    groups.set(groupKind, group);
+
     totalCents += cents;
     if (cursorOwn) ownCents += cents;
   }
 
-  if (!buckets.size) return;
+  if (!groups.size) return;
 
-  summary.byModel = [...buckets.entries()]
-    .map(([model, bucket]) => ({
-      model,
-      cursorOwn: bucket.cursorOwn,
-      spendUsd: bucket.spendCents / 100,
-      requests: bucket.requests,
-      percent: totalCents > 0 ? Math.round((bucket.spendCents / totalCents) * 100) : 0
-    }))
-    .sort((left, right) => right.spendUsd - left.spendUsd)
-    .slice(0, MAX_MODEL_ROWS);
+  // 出现最多的套餐标识胜出（BUSINESS 类事件通常压倒性多数）。
+  if (planVotes.size) {
+    summary.plan = [...planVotes.entries()].sort((left, right) => right[1] - left[1])[0][0];
+  }
+
+  const order: Array<"included" | "usageBased"> = ["included", "usageBased"];
+  summary.groups = order.flatMap((kind) => {
+    const group = groups.get(kind);
+    if (!group) return [];
+    const byModel = [...group.models.entries()]
+      .map(([model, bucket]) => ({
+        model,
+        cursorOwn: bucket.cursorOwn,
+        spendUsd: bucket.cents / 100,
+        requests: bucket.requests,
+        percent: group.spendCents > 0 ? Math.round((bucket.cents / group.spendCents) * 100) : 0
+      }))
+      .sort((left, right) => right.spendUsd - left.spendUsd)
+      .slice(0, MAX_MODEL_ROWS);
+    return [{
+      kind,
+      spendUsd: group.spendCents / 100,
+      requests: group.requests,
+      percent: totalCents > 0 ? Math.round((group.spendCents / totalCents) * 100) : 0,
+      byModel
+    }];
+  });
 
   summary.cursorOwnSpendUsd = ownCents / 100;
   summary.thirdPartySpendUsd = (totalCents - ownCents) / 100;
