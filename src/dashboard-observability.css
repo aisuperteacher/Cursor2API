@@ -1282,49 +1282,62 @@
   color: var(--console-danger);
 }
 
-/* Cursor 自家 vs 第三方模型花费占比 */
-.au-split {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
+/* 按计费方式分组：套餐内 / 按量付费 */
+.au-group {
+  margin-top: 5px;
 }
 
-.au-split-track {
-  height: 6px;
-  border-radius: 5px;
-  background: var(--console-violet);
-  overflow: hidden;
-}
-
-.au-split-own {
-  display: block;
-  height: 100%;
-  border-radius: 5px 0 0 5px;
-  background: var(--console-success);
-}
-
-.au-split-legend {
-  display: flex;
-  flex-wrap: wrap;
+.au-group-head {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr) auto;
   align-items: center;
-  gap: 4px;
-  font-size: 0.66rem;
+  gap: 8px;
+}
+
+.au-group-name {
+  font-size: 0.68rem;
+  font-weight: 700;
   color: var(--console-muted);
 }
 
-.au-dot {
-  width: 7px;
+.au-group-track {
   height: 7px;
-  border-radius: 50%;
-  flex: none;
+  border-radius: 5px;
+  background: var(--console-surface-muted);
+  overflow: hidden;
 }
 
-.au-dot.own { background: var(--console-success); }
-.au-dot.third { background: var(--console-violet); margin-left: 8px; }
+.au-group-fill {
+  display: block;
+  height: 100%;
+  border-radius: 5px;
+  background: var(--console-success);
+}
 
-/* 模型花费排行 */
+.au-group-usageBased .au-group-fill {
+  background: var(--console-warning);
+}
+
+.au-group-usageBased .au-group-name {
+  color: var(--console-warning);
+}
+
+.au-group-value {
+  font-size: 0.66rem;
+  color: var(--console-muted);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.au-plan-note {
+  margin-left: 4px;
+  font-size: 0.64rem;
+  color: var(--console-faint);
+}
+
+/* 组内模型明细 */
 .au-models {
-  margin-top: 2px;
+  margin: 2px 0 0 52px;
 }
 
 .au-models > summary {

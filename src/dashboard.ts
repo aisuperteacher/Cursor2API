@@ -23,8 +23,18 @@ interface AccountModelUsage {
   percent: number;
 }
 
+interface AccountUsageGroup {
+  kind: "included" | "usageBased";
+  spendUsd: number;
+  requests: number;
+  percent: number;
+  byModel: AccountModelUsage[];
+}
+
 interface AccountUsageSummary {
+  plan?: string;
   membershipType?: string;
+  isTeamMember?: boolean;
   spendUsd?: number;
   inputTokens?: number;
   outputTokens?: number;
@@ -33,7 +43,7 @@ interface AccountUsageSummary {
   requestLimit?: number;
   percentUsed?: number;
   periodStart?: string;
-  byModel?: AccountModelUsage[];
+  groups?: AccountUsageGroup[];
   cursorOwnSpendUsd?: number;
   thirdPartySpendUsd?: number;
   cursorOwnPercent?: number;
@@ -854,14 +864,36 @@ function formatTokenCount(value: number): string {
   return String(Math.round(value));
 }
 
+/** 把 subscriptionProductId 之类的原始标识转成可读套餐名。 */
+function planLabel(plan?: string, membershipType?: string, isTeamMember?: boolean): string {
+  const raw = (plan || membershipType || "").toLowerCase();
+  if (/enterprise|business/.test(raw)) return "ENTERPRISE";
+  if (/team/.test(raw) || isTeamMember) return "TEAM";
+  if (/ultra/.test(raw)) return "ULTRA";
+  if (/pro/.test(raw)) return "PRO";
+  if (/free/.test(raw)) return "FREE";
+  return (plan || membershipType || "").toUpperCase() || "";
+}
+
+function groupLabel(kind: AccountUsageGroup["kind"]): string {
+  return kind === "usageBased" ? "按量付费" : "套餐内";
+}
+
 function accountUsageMarkup(usage?: AccountUsageSummary | null): string {
   if (!usage) return "";
   if (usage.error) return `<small class="account-usage-error">官方用量查询失败：${escapeHtml(usage.error)}</small>`;
 
   const chips: string[] = [];
-  if (usage.membershipType) chips.push(`<span class="au-type">${escapeHtml(usage.membershipType)}</span>`);
+  const plan = planLabel(usage.plan, usage.membershipType, usage.isTeamMember);
+  if (plan) {
+    // plan 来自实际计费事件；membershipType 是个人订阅字段，两者可能不一致，冲突时并列显示。
+    const conflict = usage.membershipType && planLabel(undefined, usage.membershipType) !== plan
+      ? `<span class="au-plan-note" title="full_stripe_profile 报告的个人订阅类型">个人 ${escapeHtml(usage.membershipType)}</span>`
+      : "";
+    chips.push(`<span class="au-type">${escapeHtml(plan)}</span>${conflict}`);
+  }
   if (typeof usage.spendUsd === "number") {
-    chips.push(`<span class="au-stat">本月 <b>$${usage.spendUsd.toFixed(usage.spendUsd < 1 ? 3 : 2)}</b></span>`);
+    chips.push(`<span class="au-stat">本周期 <b>$${usage.spendUsd.toFixed(usage.spendUsd < 1 ? 3 : 2)}</b></span>`);
   }
   if (typeof usage.requests === "number" && (usage.requests > 0 || typeof usage.requestLimit === "number")) {
     const limit = typeof usage.requestLimit === "number" ? ` / ${usage.requestLimit}` : "";
@@ -873,35 +905,34 @@ function accountUsageMarkup(usage?: AccountUsageSummary | null): string {
     chips.push(`<span class="au-stat">Token <b>${formatTokenCount(tokens)}</b>${cache}</span>`);
   }
 
-  // 仅有配额上限的套餐（如 pro）才有百分比可画；free 版 maxRequestUsage 为空，不画假进度。
+  // 仅有配额上限的套餐才有百分比可画；实测账号 maxRequestUsage 为空，不画假进度。
   const bar = typeof usage.percentUsed === "number"
     ? `<span class="au-row"><em>配额</em><span class="au-track"><span class="au-fill" style="width:${usage.percentUsed}%"></span></span><b>${usage.percentUsed}%</b></span>`
     : "";
 
-  // Cursor 自家 vs 第三方模型的花费小计。拿不到配额上限，所以这里是占比而非"已用/额度"。
-  const split = typeof usage.cursorOwnPercent === "number"
-    ? `<span class="au-split"><span class="au-split-track"><span class="au-split-own" style="width:${usage.cursorOwnPercent}%"></span></span>`
-      + `<span class="au-split-legend"><i class="au-dot own"></i>Cursor 自家 ${usage.cursorOwnPercent}%`
-      + `${typeof usage.cursorOwnSpendUsd === "number" ? ` ($${usage.cursorOwnSpendUsd.toFixed(2)})` : ""}`
-      + `<i class="au-dot third"></i>第三方 ${100 - usage.cursorOwnPercent}%`
-      + `${typeof usage.thirdPartySpendUsd === "number" ? ` ($${usage.thirdPartySpendUsd.toFixed(2)})` : ""}`
-      + `</span></span>`
+  // 按计费方式分组：套餐内 / 按量付费各一条进度条 + 组内模型排行。
+  const groups = usage.groups?.length
+    ? usage.groups.map((group) => {
+        const rows = group.byModel.map((item) => `<span class="au-row"
+            ><em class="${item.cursorOwn ? "own" : "third"}" title="${escapeHtml(item.model)}">${escapeHtml(item.model)}</em
+            ><span class="au-track"><span class="au-fill${item.cursorOwn ? " own" : ""}" style="width:${Math.max(2, item.percent)}%"></span></span
+            ><b>$${item.spendUsd < 1 ? item.spendUsd.toFixed(3) : item.spendUsd.toFixed(2)} · ${item.percent}%</b></span>`).join("");
+        return `<div class="au-group au-group-${group.kind}">
+            <div class="au-group-head">
+              <span class="au-group-name">${groupLabel(group.kind)}</span>
+              <span class="au-group-track"><span class="au-group-fill" style="width:${Math.max(2, group.percent)}%"></span></span>
+              <span class="au-group-value">$${group.spendUsd.toFixed(2)} · ${group.percent}% · ${group.requests} 次</span>
+            </div>
+            ${rows ? `<details class="au-models"><summary>模型明细（${group.byModel.length}）</summary>${rows}</details>` : ""}
+          </div>`;
+      }).join("")
     : "";
 
-  const models = usage.byModel?.length
-    ? `<details class="au-models"><summary>模型花费排行（${usage.byModel.length}）</summary>`
-      + usage.byModel.map((item) => `<span class="au-row"
-          ><em class="${item.cursorOwn ? "own" : "third"}" title="${escapeHtml(item.model)}">${escapeHtml(item.model)}</em
-          ><span class="au-track"><span class="au-fill${item.cursorOwn ? " own" : ""}" style="width:${Math.max(2, item.percent)}%"></span></span
-          ><b>$${item.spendUsd < 1 ? item.spendUsd.toFixed(3) : item.spendUsd.toFixed(2)} · ${item.percent}%</b></span>`).join("")
-      + `</details>`
-    : "";
-
-  if (!chips.length && !bar && !split && !models) return "";
+  if (!chips.length && !bar && !groups) return "";
   const period = usage.periodStart
     ? `<small class="au-period">计费周期自 ${escapeHtml(formatDate(usage.periodStart))}</small>`
     : "";
-  return `<div class="account-usage"><div class="au-chips">${chips.join("")}</div>${bar}${split}${models}${period}</div>`;
+  return `<div class="account-usage"><div class="au-chips">${chips.join("")}</div>${bar}${groups}${period}</div>`;
 }
 
 function formatCurrency(value: number, currency?: string): string {
