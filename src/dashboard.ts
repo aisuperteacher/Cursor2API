@@ -15,6 +15,14 @@ interface CredentialUsage {
   models: string[];
 }
 
+interface AccountModelUsage {
+  model: string;
+  cursorOwn: boolean;
+  spendUsd: number;
+  requests: number;
+  percent: number;
+}
+
 interface AccountUsageSummary {
   membershipType?: string;
   spendUsd?: number;
@@ -25,6 +33,10 @@ interface AccountUsageSummary {
   requestLimit?: number;
   percentUsed?: number;
   periodStart?: string;
+  byModel?: AccountModelUsage[];
+  cursorOwnSpendUsd?: number;
+  thirdPartySpendUsd?: number;
+  cursorOwnPercent?: number;
   error?: string;
 }
 
@@ -866,11 +878,30 @@ function accountUsageMarkup(usage?: AccountUsageSummary | null): string {
     ? `<span class="au-row"><em>配额</em><span class="au-track"><span class="au-fill" style="width:${usage.percentUsed}%"></span></span><b>${usage.percentUsed}%</b></span>`
     : "";
 
-  if (!chips.length && !bar) return "";
+  // Cursor 自家 vs 第三方模型的花费小计。拿不到配额上限，所以这里是占比而非"已用/额度"。
+  const split = typeof usage.cursorOwnPercent === "number"
+    ? `<span class="au-split"><span class="au-split-track"><span class="au-split-own" style="width:${usage.cursorOwnPercent}%"></span></span>`
+      + `<span class="au-split-legend"><i class="au-dot own"></i>Cursor 自家 ${usage.cursorOwnPercent}%`
+      + `${typeof usage.cursorOwnSpendUsd === "number" ? ` ($${usage.cursorOwnSpendUsd.toFixed(2)})` : ""}`
+      + `<i class="au-dot third"></i>第三方 ${100 - usage.cursorOwnPercent}%`
+      + `${typeof usage.thirdPartySpendUsd === "number" ? ` ($${usage.thirdPartySpendUsd.toFixed(2)})` : ""}`
+      + `</span></span>`
+    : "";
+
+  const models = usage.byModel?.length
+    ? `<details class="au-models"><summary>模型花费排行（${usage.byModel.length}）</summary>`
+      + usage.byModel.map((item) => `<span class="au-row"
+          ><em class="${item.cursorOwn ? "own" : "third"}" title="${escapeHtml(item.model)}">${escapeHtml(item.model)}</em
+          ><span class="au-track"><span class="au-fill${item.cursorOwn ? " own" : ""}" style="width:${Math.max(2, item.percent)}%"></span></span
+          ><b>$${item.spendUsd < 1 ? item.spendUsd.toFixed(3) : item.spendUsd.toFixed(2)} · ${item.percent}%</b></span>`).join("")
+      + `</details>`
+    : "";
+
+  if (!chips.length && !bar && !split && !models) return "";
   const period = usage.periodStart
     ? `<small class="au-period">计费周期自 ${escapeHtml(formatDate(usage.periodStart))}</small>`
     : "";
-  return `<div class="account-usage"><div class="au-chips">${chips.join("")}</div>${bar}${period}</div>`;
+  return `<div class="account-usage"><div class="au-chips">${chips.join("")}</div>${bar}${split}${models}${period}</div>`;
 }
 
 function formatCurrency(value: number, currency?: string): string {

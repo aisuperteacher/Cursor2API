@@ -1282,6 +1282,92 @@
   color: var(--console-danger);
 }
 
+/* Cursor 自家 vs 第三方模型花费占比 */
+.au-split {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.au-split-track {
+  height: 6px;
+  border-radius: 5px;
+  background: var(--console-violet);
+  overflow: hidden;
+}
+
+.au-split-own {
+  display: block;
+  height: 100%;
+  border-radius: 5px 0 0 5px;
+  background: var(--console-success);
+}
+
+.au-split-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.66rem;
+  color: var(--console-muted);
+}
+
+.au-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.au-dot.own { background: var(--console-success); }
+.au-dot.third { background: var(--console-violet); margin-left: 8px; }
+
+/* 模型花费排行 */
+.au-models {
+  margin-top: 2px;
+}
+
+.au-models > summary {
+  cursor: pointer;
+  font-size: 0.68rem;
+  color: var(--console-muted);
+  list-style: none;
+}
+
+.au-models > summary::-webkit-details-marker { display: none; }
+
+.au-models > summary::before {
+  content: "▸ ";
+  color: var(--console-faint);
+}
+
+.au-models[open] > summary::before { content: "▾ "; }
+
+.au-models > summary:hover { color: var(--console-accent); }
+
+.au-models .au-row {
+  grid-template-columns: minmax(0, 1.5fr) minmax(0, 1.6fr) auto;
+  margin-top: 3px;
+}
+
+.au-models .au-row em {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: 0.64rem;
+}
+
+.au-models .au-row em.own { color: var(--console-success); }
+.au-models .au-row em.third { color: var(--console-muted); }
+
+.au-fill.own { background: var(--console-success); }
+
+.au-models .au-row b {
+  font-size: 0.64rem;
+  white-space: nowrap;
+}
+
 /* ---------- Credential pool ---------- */
 .credential-table-wrap,
 .client-key-table-wrap {
